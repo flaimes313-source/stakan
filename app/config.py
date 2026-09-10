@@ -1,8 +1,9 @@
 import os
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import List
 
-load_dotenv()
+# Загружаем .env из корня проекта
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'))
 
 class Config:
     # Bot
@@ -16,7 +17,11 @@ class Config:
     POSTGRES_USER = os.getenv('POSTGRES_USER', 'market_bot')
     POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', '')
     
-    DATABASE_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    # DATABASE_URL — сначала из переменной окружения, потом fallback
+    DATABASE_URL = os.getenv('DATABASE_URL') or (
+        f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
+        f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    )
     
     # Redis
     REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -32,11 +37,11 @@ class Config:
     
     # Trading settings
     TOP_SYMBOLS_COUNT = 50
-    SYMBOLS_UPDATE_INTERVAL = 3600  # 1 hour
+    SYMBOLS_UPDATE_INTERVAL = 3600
     ORDERBOOK_DEPTH = 50
     TRADES_HISTORY_MINUTES = 30
-    ABSORPTION_WINDOW = 10  # seconds
-    SIGNAL_COOLDOWN = 600  # 10 minutes
+    ABSORPTION_WINDOW = 10
+    SIGNAL_COOLDOWN = 600
     SIGNAL_THRESHOLD = 70
     
     # Rating weights
