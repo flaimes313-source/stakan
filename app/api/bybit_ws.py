@@ -1,131 +1,151 @@
-import websockets
-import json
+"""
+Bybit V5 публичный WebSocket (linear).
+Правильные топики:
+  orderbook.50.SYMBOL
+  publicTrade.SYMBOL
+Одно соединение держит несколько подписок (до 20 символов).
+Обработка snapshot/delta стакана — в app/datasets/orderbook.py.
+"""
 import asyncio
-from typing import Dict, List, Callable, Any
+import json
+from typing import Dict, List, Callable, Any, Optional
 from datetime import datetime
+
+import websockets
+
 from app.config import config
 from app.utils.logger import logger
 
+
 class BybitWebSocket:
+    # Bybit рекомендует ≤ 10 топиков на соединение для надёжности
+    SYMBOLS_PER_CONNECTION = 10
+
     def __init__(self):
-        self.ws_url = config.BYBIT_WS_URL  # Публичный WebSocket
-        self.connections: Dict[str, websockets.WebSocketClientProtocol] = {}
-        self.handlers: Dict[str, List[Callable]] = {}
-        self.subscriptions: Dict[str, set] = {}
+        self.ws_url = config.BYBIT_WS_URL
+        self.connections: Dict[int, websockets.WebSocketClientProtocol] = {}
+        self.symbol_to_conn: Dict[str, int] = {}
+        self.handlers: Dict[str, List[Callable]] = {
+            "orderbook": [],
+            "trade": [],
+        }
         self.running = False
-        
-    def add_handler(self, event_type: str, handler: Callable):
-        """Add event handler"""
-        if event_type not in self.handlers:
-            self.handlers[event_type] = []
-        self.handlers[event_type].append(handler)
-    
-    async def _handle_message(self, message: Dict, symbol: str):
-        """Process incoming WebSocket message"""
-        try:
-            topic = message.get('topic', '')
-            
-            # Orderbook update
-            if 'orderbook' in topic:
-                if 'orderbook' in self.handlers:
-                    for handler in self.handlers['orderbook']:
-                        await handler(symbol, message)
-            
-            # Trade updates
-            elif 'publicTrade' in topic:
-                if 'trade' in self.handlers:
-                    for handler in self.handlers['trade']:
-                        await handler(symbol, message)
-            
-        except Exception as e:
-            logger.error(f"Error handling message for {symbol}: {e}")
-    
-    async def _subscribe(self, symbol: str, topics: List[str]):
-        """Subscribe to topics for a symbol"""
-        if symbol not in self.subscriptions:
-            self.subscriptions[symbol] = set()
-        
-        for topic in topics:
-            self.subscriptions[symbol].add(topic)
-        
-        if symbol in self.connections:
-            ws = self.connections[symbol]
-            for topic in topics:
-                subscription = {
-                    "op": "subscribe",
-                    "args": [f"{topic}.{symbol}"]
-                }
-                await ws.send(json.dumps(subscription))
-                logger.info(f"Subscribed to {topic} for {symbol}")
-    
-    async def connect(self, symbol: str, topics: List[str]):
-        """Connect and subscribe to symbol topics"""
-        try:
-            ws = await websockets.connect(self.ws_url)
-            self.connections[symbol] = ws
-            self.subscriptions[symbol] = set(topics)
-            
-            # Subscribe to topics
-            for topic in topics:
-                subscription = {
-                    "op": "subscribe",
-                    "args": [f"{topic}.{symbol}"]
-                }
-                await ws.send(json.dumps(subscription))
-            
-            logger.info(f"Connected to {symbol}")
-            
-            # Start message handler
-            asyncio.create_task(self._listen(symbol, ws))
-            
-        except Exception as e:
-            logger.error(f"Connection error for {symbol}: {e}")
-            asyncio.create_task(self._reconnect(symbol, topics))
-    
-    async def _listen(self, symbol: str, ws: websockets.WebSocketClientProtocol):
-        """Listen for messages from WebSocket"""
-        while self.running:
-            try:
-                message = await ws.recv()
-                data = json.loads(message)
-                
-                if 'topic' in data:
-                    await self._handle_message(data, symbol)
-                elif 'op' in data and data['op'] == 'subscribe':
-                    if data.get('success', False):
-                        logger.info(f"Subscription successful for {symbol}")
-                
-            except websockets.ConnectionClosed:
-                logger.warning(f"Connection closed for {symbol}")
-                asyncio.create_task(self._reconnect(symbol, list(self.subscriptions.get(symbol, []))))
-                break
-            except Exception as e:
-                logger.error(f"Listen error for {symbol}: {e}")
-                await asyncio.sleep(1)
-    
-    async def _reconnect(self, symbol: str, topics: List[str]):
-        """Reconnect after connection loss"""
-        await asyncio.sleep(5)
-        if symbol in self.connections:
-            try:
-                await self.connections[symbol].close()
-            except:
-                pass
-            del self.connections[symbol]
-        
-        await self.connect(symbol, topics)
-    
+        self._conn_tasks: List[asyncio.Task] = []
+        self._recv_tasks: List[asyncio.Task] = []
+
+    def add_handler(self, event: str, handler: Callable):
+        if event not in self.handlers:
+            self.handlers[event] = []
+        self.handlers[event].append(handler)
+
     async def start(self):
-        """Start WebSocket manager"""
         self.running = True
         logger.info("WebSocket manager started")
-    
+
     async def stop(self):
-        """Stop WebSocket manager"""
         self.running = False
-        for symbol, ws in self.connections.items():
+        for task in self._recv_tasks + self._conn_tasks:
+            task.cancel()
+        for ws in list(self.connections.values()):
             try:
                 await ws.close()
-            except:
+            except Exception:
                 pass
+        self.connections.clear()
+        self.symbol_to_conn.clear()
         logger.info("WebSocket manager stopped")
+
+    async def subscribe(self, symbols: List[str]):
+        """
+        Разбиваем symbols на группы и открываем на каждую группу соединение.
+        """
+        if not symbols:
+            return
+
+        # Исключаем уже подписанные
+        new_symbols = [s for s in symbols if s not in self.symbol_to_conn]
+        if not new_symbols:
+            return
+
+        chunks = [
+            new_symbols[i:i + self.SYMBOLS_PER_CONNECTION]
+            for i in range(0, len(new_symbols), self.SYMBOLS_PER_CONNECTION)
+        ]
+
+        for idx, chunk in enumerate(chunks):
+            conn_id = len(self.connections) + idx
+            for s in chunk:
+                self.symbol_to_conn[s] = conn_id
+            task = asyncio.create_task(self._run_connection(conn_id, chunk))
+            self._conn_tasks.append(task)
+
+        logger.info(f"Открываем {len(chunks)} WS-соединений на {len(new_symbols)} символов")
+
+    # ========== Соединение ==========
+
+    async def _run_connection(self, conn_id: int, symbols: List[str]):
+        backoff = 1
+        while self.running:
+            try:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                    max_size=2**23,      # 8 МБ на пакет
+                ) as ws:
+                    self.connections[conn_id] = ws
+
+                    args = []
+                    for s in symbols:
+                        args.append(f"orderbook.{config.ORDERBOOK_DEPTH}.{s}")
+                        args.append(f"publicTrade.{s}")
+
+                    await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                    logger.info(
+                        f"WS[{conn_id}] подписка на {len(symbols)} символов "
+                        f"({len(args)} топиков)"
+                    )
+
+                    backoff = 1
+
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        await self._dispatch(msg)
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(f"WS[{conn_id}] ошибка: {e} (переподключение через {backoff}с)")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+
+    # ========== Диспетчер ==========
+
+    async def _dispatch(self, msg: Dict):
+        topic = msg.get("topic", "")
+        if not topic:
+            return
+
+        if topic.startswith("orderbook."):
+            # topic = orderbook.50.BTCUSDT
+            parts = topic.split(".")
+            if len(parts) < 3:
+                return
+            symbol = parts[2]
+            for h in self.handlers["orderbook"]:
+                try:
+                    await h(symbol, msg)
+                except Exception as e:
+                    logger.error(f"orderbook handler error {symbol}: {e}")
+
+        elif topic.startswith("publicTrade."):
+            symbol = topic.split(".", 1)[1]
+            for h in self.handlers["trade"]:
+                try:
+                    await h(symbol, msg)
+                except Exception as e:
+                    logger.error(f"trade handler error {symbol}: {e}")

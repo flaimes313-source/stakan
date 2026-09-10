@@ -1,159 +1,188 @@
-import aiohttp
+"""
+Bybit V5 публичный REST.
+Ключи не требуются.
+"""
 import asyncio
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+from datetime import datetime
+
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 from app.config import config
 from app.utils.logger import logger
+
 
 class BybitRestAPI:
     def __init__(self):
         self.base_url = config.BYBIT_REST_URL
-        # API ключи НЕ используются для публичных данных
-        
-    async def _request(self, endpoint: str, params: Dict = None) -> Dict:
-        """Make public API request (no auth needed)"""
-        url = f"{self.base_url}{endpoint}"
-        headers = {'Content-Type': 'application/json'}
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, params=params, headers=headers, timeout=30) as response:
-                    data = await response.json()
-                    if data.get('retCode') != 0:
-                        logger.error(f"API Error: {data.get('retMsg')}")
-                        return {}
-                    return data.get('result', {})
-            except asyncio.TimeoutError:
-                logger.error(f"Request timeout: {endpoint}")
-                return {}
-            except Exception as e:
-                logger.error(f"Request error: {e}")
-                return {}
-    
-    async def get_instruments(self, category: str = 'linear') -> List[Dict]:
-        """Get all instruments for a category (PUBLIC)"""
-        try:
-            result = await self._request('/v5/market/instruments-info', params={'category': category})
-            return result.get('list', []) if result else []
-        except Exception as e:
-            logger.error(f"Error getting instruments: {e}")
-            return []
-    
-    async def get_top_symbols(self, limit: int = 50) -> List[str]:
-        """Get top symbols by 24h turnover (PUBLIC)"""
-        try:
-            instruments = await self.get_instruments('linear')
-            
-            if not instruments:
-                logger.warning("No instruments found, using fallback list")
-                return self._get_fallback_symbols(limit)
-            
-            # Filter USDT perpetual contracts
-            usdt_perps = [
-                inst for inst in instruments 
-                if inst.get('contractType') == 'LinearPerpetual' 
-                and inst.get('quoteCoin') == 'USDT'
-            ]
-            
-            if not usdt_perps:
-                logger.warning("No USDT perpetual found, using fallback list")
-                return self._get_fallback_symbols(limit)
-            
-            # Sort by turnover (PUBLIC data)
-            sorted_instruments = sorted(
-                usdt_perps, 
-                key=lambda x: float(x.get('turnover24h', 0)), 
-                reverse=True
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def start(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20)
             )
-            
-            symbols = [inst['symbol'] for inst in sorted_instruments[:limit]]
-            logger.info(f"Found {len(symbols)} symbols")
-            return symbols
-            
-        except Exception as e:
-            logger.error(f"Error getting top symbols: {e}")
-            return self._get_fallback_symbols(limit)
-    
-    def _get_fallback_symbols(self, limit: int = 50) -> List[str]:
-        """Return fallback symbol list if API fails"""
-        fallback = [
-            'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
-            'BNBUSDT', 'ADAUSDT', 'LINKUSDT', 'AVAXUSDT', 'SUIUSDT',
-            'DOTUSDT', 'MATICUSDT', 'SHIBUSDT', 'LTCUSDT', 'TRXUSDT',
-            'ATOMUSDT', 'UNIUSDT', 'ARBUSDT', 'OPUSDT', 'APTUSDT',
-            'NEARUSDT', 'FILUSDT', 'ICPUSDT', 'ETCUSDT', 'XLMUSDT',
-            'HBARUSDT', 'VETUSDT', 'ALGOUSDT', 'EGLDUSDT', 'RNDRUSDT',
-            'STXUSDT', 'INJUSDT', 'MKRUSDT', 'AAVEUSDT', 'CRVUSDT',
-            'SNXUSDT', 'COMPUSDT', 'ZECUSDT', 'XMRUSDT', 'DASHUSDT',
-            'EOSUSDT', 'NEOUSDT', 'WAVESUSDT', 'XEMUSDT', 'LSKUSDT',
-            'ZILUSDT', 'ONTUSDT', 'QTUMUSDT', 'VTHOUSDT', 'CHZUSDT'
-        ]
-        logger.info(f"Using fallback symbols: {len(fallback[:limit])}")
-        return fallback[:limit]
-    
-    async def get_oi(self, symbol: str) -> Dict:
-        """Get Open Interest for a symbol (PUBLIC)"""
+
+    async def stop(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+        reraise=True,
+    )
+    async def _get(self, endpoint: str, params: Dict) -> Dict:
+        await self.start()
+        url = f"{self.base_url}{endpoint}"
+        async with self._session.get(url, params=params) as resp:
+            data = await resp.json()
+            if data.get("retCode") != 0:
+                logger.warning(f"Bybit API error {endpoint}: {data.get('retMsg')}")
+                return {}
+            return data.get("result", {}) or {}
+
+    # ========== ТИКЕРЫ ==========
+
+    async def get_all_tickers(self) -> List[Dict]:
+        """Все линейные тикеры (публичные)."""
         try:
-            result = await self._request('/v5/market/open-interest', params={
-                'category': 'linear',
-                'symbol': symbol,
-                'intervalTime': '5min',
-                'limit': 1
-            })
-            if result and 'list' in result and result['list']:
-                return {
-                    'oi': float(result['list'][0].get('openInterest', 0)),
-                    'timestamp': datetime.now()
-                }
-            return {'oi': 0, 'timestamp': datetime.now()}
+            result = await self._get(
+                "/v5/market/tickers", {"category": "linear"}
+            )
+            return result.get("list", []) or []
         except Exception as e:
-            logger.debug(f"Error getting OI for {symbol}: {e}")
-            return {'oi': 0, 'timestamp': datetime.now()}
-    
-    async def get_funding_rate(self, symbol: str) -> Dict:
-        """Get funding rate for a symbol (PUBLIC)"""
-        try:
-            result = await self._request('/v5/market/tickers', params={
-                'category': 'linear',
-                'symbol': symbol
-            })
-            if result and 'list' in result and result['list']:
-                ticker = result['list'][0]
-                return {
-                    'funding_rate': float(ticker.get('fundingRate', 0)),
-                    'next_funding_time': datetime.fromtimestamp(
-                        int(ticker.get('nextFundingTime', 0)) / 1000
-                    ) if ticker.get('nextFundingTime') else datetime.now(),
-                    'timestamp': datetime.now()
-                }
-            return {'funding_rate': 0, 'next_funding_time': datetime.now(), 'timestamp': datetime.now()}
-        except Exception as e:
-            logger.debug(f"Error getting funding for {symbol}: {e}")
-            return {'funding_rate': 0, 'next_funding_time': datetime.now(), 'timestamp': datetime.now()}
-    
+            logger.error(f"get_all_tickers failed: {e}")
+            return []
+
+    async def get_top_symbols(self, limit: int = 50) -> List[str]:
+        """
+        Top-N USDT-перпетуалов по 24h обороту.
+        Берём только те, у которых turnover24h доступен.
+        """
+        tickers = await self.get_all_tickers()
+        if not tickers:
+            logger.warning("Нет тикеров от Bybit — пустой список")
+            return []
+
+        rows = []
+        for t in tickers:
+            symbol = t.get("symbol", "")
+            if not symbol.endswith("USDT"):
+                continue
+            try:
+                turnover = float(t.get("turnover24h", 0) or 0)
+                last_price = float(t.get("lastPrice", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if turnover <= 0 or last_price <= 0:
+                continue
+            rows.append((symbol, turnover))
+
+        rows.sort(key=lambda x: x[1], reverse=True)
+        symbols = [s for s, _ in rows[:limit]]
+        logger.info(f"Top-{limit} символов получено (по turnover24h)")
+        return symbols
+
+    # ========== СВЕЧИ ==========
+
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
-        """Get kline/candlestick data (PUBLIC)"""
         try:
-            result = await self._request('/v5/market/kline', params={
-                'category': 'linear',
-                'symbol': symbol,
-                'interval': interval,
-                'limit': limit
-            })
-            if result and 'list' in result:
-                klines = []
-                for item in result['list']:
-                    klines.append({
-                        'timestamp': datetime.fromtimestamp(int(item[0]) / 1000),
-                        'open': float(item[1]),
-                        'high': float(item[2]),
-                        'low': float(item[3]),
-                        'close': float(item[4]),
-                        'volume': float(item[5]),
-                        'turnover': float(item[6])
-                    })
-                return klines
-            return []
+            result = await self._get(
+                "/v5/market/kline",
+                {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "interval": interval,
+                    "limit": limit,
+                },
+            )
         except Exception as e:
-            logger.debug(f"Error getting klines for {symbol}: {e}")
+            logger.debug(f"get_klines {symbol} {interval} failed: {e}")
             return []
+
+        raw = result.get("list", []) or []
+        out = []
+        for row in raw:
+            try:
+                out.append({
+                    "timestamp": datetime.fromtimestamp(int(row[0]) / 1000),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                    "turnover": float(row[6]),
+                })
+            except (ValueError, IndexError):
+                continue
+        # Bybit отдаёт от новых к старым — перевернём для удобства
+        out.reverse()
+        return out
+
+    # ========== OI ==========
+
+    async def get_oi(self, symbol: str) -> Optional[Dict]:
+        """
+        Открытый интерес на 5-минутном интервале.
+        Возвращает: {"oi": float, "timestamp": datetime}
+        """
+        try:
+            result = await self._get(
+                "/v5/market/open-interest",
+                {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "intervalTime": "5min",
+                    "limit": 1,
+                },
+            )
+        except Exception as e:
+            logger.debug(f"get_oi {symbol} failed: {e}")
+            return None
+
+        rows = result.get("list", []) or []
+        if not rows:
+            return None
+
+        try:
+            oi = float(rows[0].get("openInterest", 0))
+        except (TypeError, ValueError):
+            return None
+
+        return {"oi": oi, "timestamp": datetime.now()}
+
+    # ========== FUNDING ==========
+
+    async def get_funding(self, symbol: str) -> Optional[Dict]:
+        """
+        Текущий funding rate.
+        Bybit отдаёт в виде десятичной дроби (0.0001 = 0.01%).
+        """
+        try:
+            result = await self._get(
+                "/v5/market/tickers",
+                {"category": "linear", "symbol": symbol},
+            )
+        except Exception as e:
+            logger.debug(f"get_funding {symbol} failed: {e}")
+            return None
+
+        rows = result.get("list", []) or []
+        if not rows:
+            return None
+        t = rows[0]
+        try:
+            rate = float(t.get("fundingRate", 0) or 0)
+            next_ts = int(t.get("nextFundingTime", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+
+        return {
+            "funding_rate": rate,                       # десятичная дробь
+            "next_funding_time": datetime.fromtimestamp(next_ts / 1000) if next_ts else None,
+            "timestamp": datetime.now(),
+        }

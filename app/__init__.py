@@ -1,12 +1,4 @@
-# app/__init__.py
 """
-Market Analysis Bot Package
+Market Analysis Bot
 """
-from .config import config
-from .utils.logger import logger
-
-__version__ = "1.0.0"
-__all__ = [
-    'config',
-    'logger'
-]
+__version__ = "2.0.0"

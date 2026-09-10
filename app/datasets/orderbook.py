@@ -1,349 +1,239 @@
+"""
+Локальная книга заявок по правилам Bybit V5:
+  - snapshot: полная замена
+  - delta: применяем к локальной книге
+  - update_id (u) и seq — для контроля
+"""
 import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from collections import deque
+
 from app.models import OrderBook, OrderBookEntry
 from app.api.bybit_ws import BybitWebSocket
-from app.storage.redis import RedisStorage
+from app.storage.store import Store
 from app.config import config
 from app.utils.logger import logger
 
+
 class OrderBookManager:
-    def __init__(self, websocket: BybitWebSocket, redis: RedisStorage):
-        self.ws = websocket
-        self.redis = redis
-        self.postgres = None  # Будет установлен извне
-        self.orderbooks: Dict[str, OrderBook] = {}
-        self.orderbook_history: Dict[str, deque] = {}
-        self.tracking: Dict[str, Dict] = {}
+    def __init__(self, ws: BybitWebSocket, store: Store):
+        self.ws = ws
+        self.store = store
+        self.postgres = None
+
+        # symbol -> {"bids": {price: size}, "asks": {price: size}, "u": int, "ts": datetime}
+        self._books: Dict[str, Dict] = {}
+
         self.running = False
         self._lock = asyncio.Lock()
-        
-        # Register handlers
-        self.ws.add_handler('orderbook', self._handle_orderbook_update)
-        self.ws.add_handler('trade', self._handle_trade)
-    
+
+        self.ws.add_handler("orderbook", self._on_orderbook)
+        self.ws.add_handler("trade", self._on_trade)
+
+        # медиана размера ордера
+        self._order_sizes: Dict[str, deque] = {}
+        self._order_sizes_max = 500
+        self._last_median_update: Dict[str, datetime] = {}
+
+        # крупные заявки
+        self.tracking: Dict[str, Dict] = {}
+
     def set_postgres(self, postgres):
-        """Установить ссылку на PostgreSQL"""
         self.postgres = postgres
-    
-    async def _handle_orderbook_update(self, symbol: str, data: Dict):
-        """Process orderbook update from WebSocket"""
-        try:
-            if 'data' in data and data['data']:
-                orderbook_data = data['data']
-                
-                bids = [
-                    OrderBookEntry(
-                        price=float(entry[0]),
-                        size=float(entry[1]),
-                        is_bid=True
-                    )
-                    for entry in orderbook_data.get('b', [])[:50]
-                ]
-                
-                asks = [
-                    OrderBookEntry(
-                        price=float(entry[0]),
-                        size=float(entry[1]),
-                        is_bid=False
-                    )
-                    for entry in orderbook_data.get('a', [])[:50]
-                ]
-                
-                orderbook = OrderBook(
-                    symbol=symbol,
-                    bids=bids,
-                    asks=asks,
-                    timestamp=datetime.now()
-                )
-                
-                async with self._lock:
-                    self.orderbooks[symbol] = orderbook
-                
-                await self.redis.set_orderbook(symbol, orderbook)
-                await self._track_large_orders(symbol, orderbook)
-                await self._analyze_orderbook(symbol, orderbook)
-                
-        except Exception as e:
-            logger.error(f"Error processing orderbook update for {symbol}: {e}")
-    
-    async def _track_large_orders(self, symbol: str, orderbook: OrderBook):
-        """Track large orders in the orderbook"""
-        try:
-            median_size = await self.redis.get_median_order_size(symbol)
-            if median_size == 0:
-                median_size = 1000
-            
-            for side, entries in [('bid', orderbook.bids), ('ask', orderbook.asks)]:
-                for entry in entries[:10]:
-                    size_ratio = entry.size / median_size if median_size > 0 else 0
-                    
-                    if size_ratio >= config.ORDER_SIZE_THRESHOLDS['large']:
-                        key = f"{symbol}:{side}:{entry.price}"
-                        current_time = datetime.now()
-                        
-                        if key not in self.tracking:
-                            self.tracking[key] = {
-                                'symbol': symbol,
-                                'side': side,
-                                'price': entry.price,
-                                'first_seen': current_time,
-                                'last_seen': current_time,
-                                'initial_size': entry.size,
-                                'current_size': entry.size,
-                                'max_size': entry.size,
-                                'executed_estimate': 0,
-                                'cancelled_estimate': 0,
-                                'history': deque(maxlen=100),
-                                'notifications_sent': False
-                            }
-                            # Сохраняем в PostgreSQL
-                            if self.postgres:
-                                await self.postgres.save_large_order(self.tracking[key])
-                            await self.redis.save_large_order(key, self.tracking[key])
-                        else:
-                            track = self.tracking[key]
-                            track['last_seen'] = current_time
-                            track['current_size'] = entry.size
-                            track['max_size'] = max(track['max_size'], entry.size)
-                            
-                            if track['current_size'] < track['max_size'] * 0.8:
-                                await self._check_order_reduction(track)
-                            
-                            # Обновляем в PostgreSQL
-                            if self.postgres:
-                                await self.postgres.save_large_order(track)
-                            await self.redis.save_large_order(key, track)
-        
-        except Exception as e:
-            logger.error(f"Error tracking large orders: {e}")
-    
-    async def _check_order_reduction(self, track: Dict):
-        """Check if order reduction is due to execution or cancellation"""
-        try:
-            trades = await self.redis.get_recent_trades(track['symbol'], minutes=5)
-            
-            executed = sum(
-                t['size'] for t in trades
-                if abs(t['price'] - track['price']) < track['price'] * 0.001
-            )
-            
-            reduction = track['max_size'] - track['current_size']
-            
-            if reduction > executed * 1.2:
-                track['cancelled_estimate'] = reduction - executed
-                track['status'] = 'cancelled'
-                await self._handle_spoofing_signal(track)
-            else:
-                track['executed_estimate'] = executed
-                track['status'] = 'executed'
-            
-        except Exception as e:
-            logger.error(f"Error checking order reduction: {e}")
-    
-    async def _handle_spoofing_signal(self, track: Dict):
-        """Handle possible spoofing detection"""
-        signal_data = {
-            'type': 'SPOOFING',
-            'symbol': track['symbol'],
-            'side': 'SELL' if track['side'] == 'ask' else 'BUY',
-            'price': track['price'],
-            'initial_size': track['max_size'],
-            'remaining_size': track['current_size'],
-            'reduction': track['max_size'] - track['current_size'],
-            'timestamp': datetime.now()
-        }
-        
-        await self.redis.save_signal(track['symbol'], signal_data)
-        logger.warning(f"Possible spoofing detected: {track['symbol']} at {track['price']}")
-    
-    async def _analyze_orderbook(self, symbol: str, orderbook: OrderBook):
-        """Analyze orderbook for imbalances and liquidity zones"""
-        try:
-            bid_volume = sum(b.size for b in orderbook.bids[:20])
-            ask_volume = sum(a.size for a in orderbook.asks[:20])
-            
-            if bid_volume + ask_volume > 0:
-                imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume)
-            else:
-                imbalance = 0
-            
-            await self.redis.set_imbalance(symbol, imbalance)
-            
-            zones = await self._find_liquidity_zones(symbol, orderbook)
-            
-            median_size = await self.redis.get_median_order_size(symbol)
-            if median_size == 0:
-                median_size = 1000
-                
-            for zone in zones:
-                if zone['total_volume'] > median_size * 10:
-                    await self._handle_liquidity_zone(symbol, zone)
-            
-        except Exception as e:
-            logger.error(f"Error analyzing orderbook: {e}")
-    
-    async def _find_liquidity_zones(self, symbol: str, orderbook: OrderBook) -> List[Dict]:
-        """Find liquidity zones in orderbook"""
-        zones = []
-        price_threshold = orderbook.mid_price * 0.001
-        
-        for side, entries in [('bid', orderbook.bids), ('ask', orderbook.asks)]:
-            if not entries:
-                continue
-            
-            current_zone = {
-                'side': side,
-                'min_price': entries[0].price,
-                'max_price': entries[0].price,
-                'total_volume': 0,
-                'entries': []
-            }
-            
-            for entry in entries[:20]:
-                if entry.price - current_zone['max_price'] <= price_threshold:
-                    current_zone['min_price'] = min(current_zone['min_price'], entry.price)
-                    current_zone['max_price'] = max(current_zone['max_price'], entry.price)
-                    current_zone['total_volume'] += entry.size
-                    current_zone['entries'].append(entry)
-                else:
-                    if current_zone['total_volume'] > 0:
-                        zones.append(current_zone)
-                    current_zone = {
-                        'side': side,
-                        'min_price': entry.price,
-                        'max_price': entry.price,
-                        'total_volume': entry.size,
-                        'entries': [entry]
-                    }
-            
-            if current_zone['total_volume'] > 0:
-                zones.append(current_zone)
-        
-        return zones
-    
-    async def _handle_liquidity_zone(self, symbol: str, zone: Dict):
-        """Handle significant liquidity zone"""
-        signal_data = {
-            'type': 'LIQUIDITY_ZONE',
-            'symbol': symbol,
-            'side': 'SELL' if zone['side'] == 'ask' else 'BUY',
-            'price_min': zone['min_price'],
-            'price_max': zone['max_price'],
-            'total_volume': zone['total_volume'],
-            'timestamp': datetime.now()
-        }
-        
-        await self.redis.save_signal(symbol, signal_data)
-        
-        if zone['side'] == 'ask':
-            await self._check_sell_wall(symbol, zone)
-        else:
-            await self._check_buy_wall(symbol, zone)
-    
-    async def _check_sell_wall(self, symbol: str, zone: Dict):
-        """Check if liquidity zone is a sell wall"""
-        levels = await self.redis.get_levels(symbol)
-        for level in levels:
-            if abs(level['price'] - zone['min_price']) < level['price'] * 0.005:
-                signal_data = {
-                    'type': 'SELL_WALL',
-                    'symbol': symbol,
-                    'level': level['price'],
-                    'strength': level['strength'],
-                    'volume': zone['total_volume'],
-                    'timestamp': datetime.now()
-                }
-                await self.redis.save_signal(symbol, signal_data)
-    
-    async def _check_buy_wall(self, symbol: str, zone: Dict):
-        """Check if liquidity zone is a buy wall"""
-        levels = await self.redis.get_levels(symbol)
-        for level in levels:
-            if abs(level['price'] - zone['max_price']) < level['price'] * 0.005:
-                signal_data = {
-                    'type': 'BUY_WALL',
-                    'symbol': symbol,
-                    'level': level['price'],
-                    'strength': level['strength'],
-                    'volume': zone['total_volume'],
-                    'timestamp': datetime.now()
-                }
-                await self.redis.save_signal(symbol, signal_data)
-    
-    async def _handle_trade(self, symbol: str, data: Dict):
-        """Process trade data"""
-        try:
-            if 'data' in data and data['data']:
-                for trade_data in data['data']:
-                    trade = {
-                        'symbol': symbol,
-                        'price': float(trade_data['p']),
-                        'size': float(trade_data['v']),
-                        'side': trade_data['S'],
-                        'timestamp': datetime.fromtimestamp(int(trade_data['T']) / 1000),
-                        'notional': float(trade_data['p']) * float(trade_data['v'])
-                    }
-                    await self.redis.add_trade(symbol, trade)
-                    
-                    # Сохраняем в PostgreSQL (только крупные сделки > $10k)
-                    if self.postgres and trade['notional'] > 10000:
-                        await self.postgres.save_trade(symbol, trade)
-                
-                await self._update_volume_stats(symbol, data['data'])
-                
-        except Exception as e:
-            logger.error(f"Error handling trade for {symbol}: {e}")
-    
-    async def _update_volume_stats(self, symbol: str, trades: List[Dict]):
-        """Update volume statistics"""
-        try:
-            buy_volume = sum(
-                float(t['p']) * float(t['v']) 
-                for t in trades if t['S'] == 'Buy'
-            )
-            sell_volume = sum(
-                float(t['p']) * float(t['v']) 
-                for t in trades if t['S'] == 'Sell'
-            )
-            
-            await self.redis.update_volume_stats(symbol, buy_volume, sell_volume)
-            
-        except Exception as e:
-            logger.error(f"Error updating volume stats: {e}")
-    
-    async def get_orderbook(self, symbol: str) -> Optional[OrderBook]:
-        """Get current orderbook for symbol"""
-        return self.orderbooks.get(symbol)
-    
+
     async def start(self):
-        """Start orderbook manager"""
         self.running = True
-        logger.info("Orderbook manager started")
+        asyncio.create_task(self._median_updater())
         asyncio.create_task(self._cleanup_task())
-    
+        logger.info("OrderBook manager started")
+
     async def stop(self):
-        """Stop orderbook manager"""
         self.running = False
-        logger.info("Orderbook manager stopped")
-    
-    async def _cleanup_task(self):
-        """Clean up old tracking data"""
+        logger.info("OrderBook manager stopped")
+
+    # ========== ОБРАБОТКА ORDERBOOK ==========
+
+    async def _on_orderbook(self, symbol: str, msg: Dict):
+        try:
+            data = msg.get("data") or {}
+            msg_type = msg.get("type")  # snapshot | delta
+            update_id = int(data.get("u", 0))
+            seq = int(data.get("seq", 0))
+
+            async with self._lock:
+                book = self._books.get(symbol)
+
+                if msg_type == "snapshot" or book is None:
+                    bids = {float(p): float(s) for p, s in data.get("b", [])}
+                    asks = {float(p): float(s) for p, s in data.get("a", [])}
+                    self._books[symbol] = {
+                        "bids": bids,
+                        "asks": asks,
+                        "u": update_id,
+                        "seq": seq,
+                        "ts": datetime.now(),
+                    }
+                else:
+                    # delta — проверяем преемственность
+                    if update_id <= book["u"]:
+                        return
+                    self._apply_side(book["bids"], data.get("b", []))
+                    self._apply_side(book["asks"], data.get("a", []))
+                    book["u"] = update_id
+                    book["seq"] = seq
+                    book["ts"] = datetime.now()
+
+                # Собираем топ-50
+                top_bids = sorted(book["bids"].items(), key=lambda x: -x[0])[: config.ORDERBOOK_DEPTH]
+                top_asks = sorted(book["asks"].items(), key=lambda x: x[0])[: config.ORDERBOOK_DEPTH]
+
+            orderbook = OrderBook(
+                symbol=symbol,
+                bids=[OrderBookEntry(price=p, size=s) for p, s in top_bids if s > 0],
+                asks=[OrderBookEntry(price=p, size=s) for p, s in top_asks if s > 0],
+                timestamp=book["ts"],
+                update_id=book["u"],
+                is_snapshot=(msg_type == "snapshot"),
+            )
+
+            await self.store.set_orderbook(symbol, orderbook)
+            await self._track_large_orders(symbol, orderbook)
+            await self._analyze(symbol, orderbook)
+
+            # обновляем медиану размера ордера
+            for _, size in top_bids[:20]:
+                self._order_sizes.setdefault(symbol, deque(maxlen=self._order_sizes_max)).append(size)
+            for _, size in top_asks[:20]:
+                self._order_sizes.setdefault(symbol, deque(maxlen=self._order_sizes_max)).append(size)
+
+        except Exception as e:
+            logger.error(f"orderbook error {symbol}: {e}")
+
+    def _apply_side(self, side: Dict[float, float], updates: List[List]):
+        for p_str, s_str in updates:
+            price = float(p_str)
+            size = float(s_str)
+            if size == 0:
+                side.pop(price, None)
+            else:
+                side[price] = size
+
+    # ========== СДЕЛКИ ==========
+
+    async def _on_trade(self, symbol: str, msg: Dict):
+        try:
+            trades = msg.get("data") or []
+            for t in trades:
+                trade = {
+                    "symbol": symbol,
+                    "price": float(t["p"]),
+                    "size": float(t["v"]),
+                    "side": t["S"],                         # "Buy" / "Sell"
+                    "timestamp": datetime.fromtimestamp(int(t["T"]) / 1000),
+                    "notional": float(t["p"]) * float(t["v"]),
+                }
+                await self.store.add_trade(symbol, trade)
+                if self.postgres and trade["notional"] >= 50_000:
+                    await self.postgres.save_trade(symbol, trade)
+        except Exception as e:
+            logger.error(f"trade error {symbol}: {e}")
+
+    # ========== МЕДИАНА ==========
+
+    async def _median_updater(self):
         while self.running:
-            await asyncio.sleep(60)
-            
             try:
-                current_time = datetime.now()
-                to_delete = []
-                
-                for key, track in self.tracking.items():
-                    if (current_time - track['last_seen']).total_seconds() > 3600:
-                        to_delete.append(key)
-                
-                for key in to_delete:
-                    del self.tracking[key]
-                    await self.redis.delete_key(key)
-                
+                await asyncio.sleep(60)
+                for symbol, dq in list(self._order_sizes.items()):
+                    if not dq:
+                        continue
+                    sizes = sorted(dq)
+                    median = sizes[len(sizes) // 2]
+                    await self.store.set_median_order_size(symbol, median)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error(f"Cleanup task error: {e}")
+                logger.error(f"median updater: {e}")
+
+    # ========== КРУПНЫЕ ЗАЯВКИ ==========
+
+    async def _track_large_orders(self, symbol: str, ob: OrderBook):
+        try:
+            median = await self.store.get_median_order_size(symbol)
+            if median <= 0:
+                return
+
+            now = datetime.now()
+            session_id = int(now.timestamp() // 3600)  # новая сессия каждый час
+
+            for side, entries in (("bid", ob.bids), ("ask", ob.asks)):
+                for e in entries[:10]:
+                    ratio = e.size / median
+                    if ratio < config.ORDER_SIZE_THRESHOLDS["large"]:
+                        continue
+
+                    key = f"{symbol}:{side}:{e.price}"
+                    if key not in self.tracking:
+                        rec = {
+                            "symbol": symbol,
+                            "side": side,
+                            "price": e.price,
+                            "initial_size": e.size,
+                            "max_size": e.size,
+                            "current_size": e.size,
+                            "executed_estimate": 0.0,
+                            "cancelled_estimate": 0.0,
+                            "first_seen": now,
+                            "last_seen": now,
+                            "status": "active",
+                            "session_id": session_id,
+                        }
+                        self.tracking[key] = rec
+                    else:
+                        rec = self.tracking[key]
+                        rec["last_seen"] = now
+                        rec["current_size"] = e.size
+                        rec["max_size"] = max(rec["max_size"], e.size)
+
+                    if self.postgres:
+                        await self.postgres.save_large_order(rec)
+                    await self.store.save_large_order(key, rec)
+
+        except Exception as e:
+            logger.error(f"track_large_orders: {e}")
+
+    # ========== АНАЛИЗ ==========
+
+    async def _analyze(self, symbol: str, ob: OrderBook):
+        if not ob.bids or not ob.asks:
+            return
+        bid_vol = sum(b.size for b in ob.bids[:20])
+        ask_vol = sum(a.size for a in ob.asks[:20])
+        total = bid_vol + ask_vol
+        if total <= 0:
+            return
+        imbalance = (bid_vol - ask_vol) / total
+        await self.store.set_imbalance(symbol, imbalance)
+
+    # ========== ОЧИСТКА ==========
+
+    async def _cleanup_task(self):
+        while self.running:
+            try:
+                await asyncio.sleep(120)
+                now = datetime.now()
+                old = [k for k, r in self.tracking.items()
+                       if (now - r["last_seen"]).total_seconds() > 3600]
+                for k in old:
+                    del self.tracking[k]
+                    await self.store.delete_key(f"order_track:{k}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"cleanup: {e}")
+
+    # ========== ДОСТУП ==========
+
+    def get_local_book(self, symbol: str) -> Optional[Dict]:
+        return self._books.get(symbol)

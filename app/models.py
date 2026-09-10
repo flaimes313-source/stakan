@@ -1,9 +1,10 @@
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Any
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import List, Dict, Any, Optional
 
-class SignalState(Enum):
+
+class SignalState(str, Enum):
     NEW = "NEW"
     WATCH = "WATCH"
     ABSORPTION = "ABSORPTION"
@@ -11,55 +12,72 @@ class SignalState(Enum):
     TRIGGERED = "TRIGGERED"
     EXPIRED = "EXPIRED"
 
-class SignalLevel(Enum):
+
+class SignalType(str, Enum):
+    SETUP = "SETUP"
+    CONFIRMATION = "CONFIRMATION"
+
+
+class SignalLevel(str, Enum):
     EXTREME = "EXTREME"
     STRONG = "STRONG"
     WATCH = "WATCH"
     INTERESTING = "INTERESTING"
     NONE = "NONE"
 
-class SignalType(Enum):
-    SETUP = "SETUP"
-    CONFIRMATION = "CONFIRMATION"
 
 @dataclass
 class OrderBookEntry:
     price: float
     size: float
-    is_bid: bool
-    
+
+
 @dataclass
 class OrderBook:
     symbol: str
     bids: List[OrderBookEntry]
     asks: List[OrderBookEntry]
     timestamp: datetime
-    
+    update_id: int = 0
+    is_snapshot: bool = False
+
     @property
     def best_bid(self) -> float:
-        return self.bids[0].price if self.bids else 0
-    
+        return self.bids[0].price if self.bids else 0.0
+
     @property
     def best_ask(self) -> float:
-        return self.asks[0].price if self.asks else 0
-    
-    @property
-    def spread(self) -> float:
-        return self.best_ask - self.best_bid
-    
+        return self.asks[0].price if self.asks else 0.0
+
     @property
     def mid_price(self) -> float:
-        return (self.best_bid + self.best_ask) / 2
+        bb, ba = self.best_bid, self.best_ask
+        return (bb + ba) / 2 if bb and ba else 0.0
+
+    @property
+    def spread(self) -> float:
+        return self.best_ask - self.best_bid if self.best_bid and self.best_ask else 0.0
+
 
 @dataclass
 class Trade:
     symbol: str
     price: float
     size: float
-    side: str  # 'Buy' or 'Sell'
+    side: str                # "Buy" / "Sell"
     timestamp: datetime
     notional: float
-    
+
+
+@dataclass
+class Ticker:
+    symbol: str
+    last_price: float
+    turnover_24h: float
+    volume_24h: float
+    timestamp: datetime
+
+
 @dataclass
 class Level:
     price: float
@@ -69,20 +87,19 @@ class Level:
     volume: float
     is_support: bool
 
+
 @dataclass
 class Signal:
     symbol: str
-    direction: str  # 'LONG' or 'SHORT'
+    direction: str                       # "LONG" / "SHORT"
     level: float
     score: int
     state: SignalState
     signal_type: SignalType = SignalType.SETUP
-    timestamp: datetime = None
-    factors: Dict[str, Any] = None
+    timestamp: Optional[datetime] = None
+    factors: Dict[str, Any] = field(default_factory=dict)
     message: str = ""
-    
+
     def __post_init__(self):
         if self.timestamp is None:
             self.timestamp = datetime.now()
-        if self.factors is None:
-            self.factors = {}

@@ -1,58 +1,9 @@
-﻿# Virtual Environment
-venv/
+﻿venv/
 app/venv/
-ENV/
-env/
-
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Environment variables
+*.pyc
 .env
-.env.local
-.env.*.local
-
-# Logs
 logs/
 *.log
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Database
 *.db
 *.sqlite3
-
-# Redis
-dump.rdb
-
-# Tests
-.pytest_cache/
-.coverage

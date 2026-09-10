@@ -1,14 +1,5 @@
-# app/datasets/__init__.py
 from .orderbook import OrderBookManager
 from .trades import TradeAnalyzer
-from .oi import OIManager
-from .funding import FundingManager
-from .candles import CandleManager
+from .market_data import MarketDataCore
 
-__all__ = [
-    'OrderBookManager',
-    'TradeAnalyzer',
-    'OIManager',
-    'FundingManager',
-    'CandleManager'
-]
+__all__ = ["OrderBookManager", "TradeAnalyzer", "MarketDataCore"]

@@ -1,75 +1,93 @@
-from typing import Dict, List, Optional
-from datetime import datetime, timedelta
-from app.models import Signal
-from app.storage.redis import RedisStorage
+"""
+Память сигналов.
+Правила:
+- Один и тот же сигнал (symbol + direction) не повторяется, пока:
+  - не прошёл cooldown, И
+  - score не вырос на MIN_DELTA.
+- Память живёт в FileStore → переживает рестарт.
+"""
+import time
+from typing import Dict, Optional
+
+from app.storage.store import Store
+from app.config import config
 from app.utils.logger import logger
 
+
 class SignalMemory:
-    """Память сигналов для антиспама"""
-    
-    def __init__(self, redis: RedisStorage):
-        self.redis = redis
-        self.signals: Dict[str, Dict] = {}
-        self.cooldown = 600  # 10 минут
-        
-    async def remember(self, signal: Signal) -> bool:
-        """Запомнить сигнал"""
-        key = f"{signal.symbol}:{signal.direction}"
-        
-        # Проверяем, есть ли уже такой сигнал
-        if key in self.signals:
-            last = self.signals[key]
-            
-            # Проверяем cooldown
-            if (datetime.now() - last['timestamp']).total_seconds() < self.cooldown:
-                # Проверяем, значительно ли улучшился скор
-                if signal.score - last['score'] < 10:
-                    return False
-            
-            # Обновляем
-            self.signals[key].update({
-                'score': signal.score,
-                'state': signal.state,
-                'timestamp': datetime.now(),
-                'message': signal.message
-            })
-        else:
-            # Новый сигнал
-            self.signals[key] = {
-                'symbol': signal.symbol,
-                'direction': signal.direction,
-                'score': signal.score,
-                'state': signal.state,
-                'timestamp': datetime.now(),
-                'message': signal.message,
-                'first_seen': datetime.now()
-            }
-        
-        # Сохраняем в Redis
-        await self.redis.save_signal(key, self.signals[key])
-        
-        return True
-    
-    def get_last_signal(self, symbol: str, direction: str) -> Optional[Dict]:
-        """Получить последний сигнал"""
-        key = f"{symbol}:{direction}"
-        return self.signals.get(key)
-    
-    def get_active_signals(self) -> Dict[str, Dict]:
-        """Получить все активные сигналы"""
-        # Очищаем старые сигналы
-        self._cleanup()
-        return self.signals
-    
-    def _cleanup(self):
-        """Очистить старые сигналы"""
-        now = datetime.now()
-        expired = []
-        
-        for key, signal in self.signals.items():
-            if (now - signal['timestamp']).total_seconds() > self.cooldown * 6:  # 1 час
-                expired.append(key)
-        
-        for key in expired:
-            del self.signals[key]
-            logger.debug(f"Removed expired signal: {key}")
+    KEY = "signals_memory"
+
+    def __init__(self, store: Store):
+        self.store = store
+        self._cache: Dict[str, Dict] = {}
+        self._loaded = False
+
+    async def load(self):
+        data = await self.store._get(self.KEY)
+        if isinstance(data, dict):
+            self._cache = data
+        self._loaded = True
+
+    async def _flush(self):
+        await self.store._set(self.KEY, self._cache, ttl=None)
+
+    def _key(self, symbol: str, direction: str) -> str:
+        return f"{symbol}:{direction}"
+
+    async def should_send(
+        self,
+        symbol: str,
+        direction: str,
+        score: int,
+        level_price: float,
+        min_delta: int = 10,
+    ) -> bool:
+        if not self._loaded:
+            await self.load()
+
+        key = self._key(symbol, direction)
+        now = time.time()
+        rec = self._cache.get(key)
+
+        if rec is None:
+            return True
+
+        # cooldown
+        since = now - rec.get("last_ts", 0)
+        if since < config.SIGNAL_COOLDOWN_SEC:
+            # Только если score ощутимо вырос — можно прислать «усиление»
+            if score - rec.get("score", 0) >= min_delta:
+                return True
+            return False
+
+        # cooldown прошёл
+        if score - rec.get("score", 0) >= min_delta:
+            return True
+
+        # Цена уровня сменилась — новый сигнал
+        if abs(level_price - rec.get("level_price", 0)) / max(level_price, 1e-9) > 0.002:
+            return True
+
+        return False
+
+    async def remember(
+        self,
+        symbol: str,
+        direction: str,
+        score: int,
+        level_price: float,
+        message: str = "",
+    ):
+        if not self._loaded:
+            await self.load()
+
+        key = self._key(symbol, direction)
+        self._cache[key] = {
+            "symbol": symbol,
+            "direction": direction,
+            "score": score,
+            "level_price": level_price,
+            "last_ts": time.time(),
+            "message": message[:200],
+        }
+        await self._flush()

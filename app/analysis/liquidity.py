@@ -1,148 +1,62 @@
-from typing import Dict, List, Optional
-from datetime import datetime, timedelta
-from app.storage.redis import RedisStorage
+"""
+Ликвидность: концентрация в топ-5, крупные заявки, зоны.
+"""
+from typing import Dict, List
+
+from app.storage.store import Store
+from app.config import config
 from app.utils.logger import logger
 
+
 class LiquidityAnalyzer:
-    """Анализ ликвидности"""
-    
-    def __init__(self, redis: RedisStorage):
-        self.redis = redis
-        
-    async def analyze_liquidity(self, symbol: str, orderbook: Dict) -> Dict:
-        """Анализировать ликвидность в стакане"""
+    def __init__(self, store: Store):
+        self.store = store
+
+    async def analyze(self, symbol: str) -> Dict:
         try:
-            bids = orderbook.get('bids', [])
-            asks = orderbook.get('asks', [])
-            
-            if not bids or not asks:
-                return {
-                    'total_bid_liquidity': 0,
-                    'total_ask_liquidity': 0,
-                    'total_liquidity': 0,
-                    'liquidity_concentration': 0
-                }
-            
-            # Общая ликвидность
-            total_bid = sum(b[1] for b in bids[:20])
-            total_ask = sum(a[1] for a in asks[:20])
-            total_liquidity = total_bid + total_ask
-            
-            # Концентрация ликвидности (сколько в первых 5 уровнях)
-            top_5_bid = sum(b[1] for b in bids[:5])
-            top_5_ask = sum(a[1] for a in asks[:5])
-            top_5_total = top_5_bid + top_5_ask
-            
-            concentration = top_5_total / total_liquidity if total_liquidity > 0 else 0
-            
-            # Находим зоны ликвидности
-            zones = await self._find_liquidity_zones(bids, asks)
-            
-            # Находим крупные заявки
-            large_orders = await self._find_large_orders(symbol, bids, asks)
-            
-            result = {
-                'total_bid_liquidity': total_bid,
-                'total_ask_liquidity': total_ask,
-                'total_liquidity': total_liquidity,
-                'liquidity_concentration': concentration,
-                'zones': zones,
-                'large_orders': large_orders,
-                'timestamp': datetime.now()
-            }
-            
-            # Сохраняем в Redis
-            await self.redis.set_liquidity_analysis(symbol, result)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error analyzing liquidity for {symbol}: {e}")
+            ob = await self.store.get_orderbook(symbol)
+            if not ob or not ob.get("bids") or not ob.get("asks"):
+                return {"total_bid": 0, "total_ask": 0, "concentration": 0, "large_orders": []}
+
+            bids = ob["bids"]
+            asks = ob["asks"]
+
+            total_bid = sum(float(s) for _, s in bids)
+            total_ask = sum(float(s) for _, s in asks)
+            total = total_bid + total_ask
+            if total <= 0:
+                return {"total_bid": 0, "total_ask": 0, "concentration": 0, "large_orders": []}
+
+            top5_bid = sum(float(s) for _, s in bids[:5])
+            top5_ask = sum(float(s) for _, s in asks[:5])
+            concentration = (top5_bid + top5_ask) / total
+
+            median = await self.store.get_median_order_size(symbol)
+            large_orders = []
+            if median > 0:
+                for side, rows in (("bid", bids), ("ask", asks)):
+                    for price, size in rows[:20]:
+                        size = float(size)
+                        ratio = size / median
+                        if ratio >= config.ORDER_SIZE_THRESHOLDS["large"]:
+                            large_orders.append({
+                                "side": side,
+                                "price": float(price),
+                                "size": size,
+                                "ratio": ratio,
+                                "category": (
+                                    "extreme" if ratio >= config.ORDER_SIZE_THRESHOLDS["extreme"]
+                                    else "very_large" if ratio >= config.ORDER_SIZE_THRESHOLDS["very_large"]
+                                    else "large"
+                                ),
+                            })
+
             return {
-                'total_bid_liquidity': 0,
-                'total_ask_liquidity': 0,
-                'total_liquidity': 0,
-                'liquidity_concentration': 0
+                "total_bid": total_bid,
+                "total_ask": total_ask,
+                "concentration": concentration,
+                "large_orders": large_orders,
             }
-    
-    async def _find_liquidity_zones(self, bids: List, asks: List) -> List[Dict]:
-        """Найти зоны ликвидности"""
-        zones = []
-        
-        # Группируем заявки по цене
-        def group_orders(orders, side):
-            if not orders:
-                return []
-            
-            grouped = []
-            current_group = {
-                'side': side,
-                'min_price': orders[0][0],
-                'max_price': orders[0][0],
-                'total_size': 0,
-                'orders': []
-            }
-            
-            for price, size in orders[:20]:
-                if price - current_group['max_price'] <= 2:  # Группируем близкие цены
-                    current_group['max_price'] = price
-                    current_group['total_size'] += size
-                    current_group['orders'].append({'price': price, 'size': size})
-                else:
-                    if current_group['total_size'] > 0:
-                        grouped.append(current_group)
-                    current_group = {
-                        'side': side,
-                        'min_price': price,
-                        'max_price': price,
-                        'total_size': size,
-                        'orders': [{'price': price, 'size': size}]
-                    }
-            
-            if current_group['total_size'] > 0:
-                grouped.append(current_group)
-            
-            return grouped
-        
-        zones.extend(group_orders(bids, 'bid'))
-        zones.extend(group_orders(asks, 'ask'))
-        
-        # Сортируем по размеру
-        zones.sort(key=lambda x: x['total_size'], reverse=True)
-        
-        return zones[:5]  # Топ 5 зон
-    
-    async def _find_large_orders(self, symbol: str, bids: List, asks: List) -> List[Dict]:
-        """Найти крупные заявки"""
-        large_orders = []
-        
-        # Получаем медианный размер
-        median_size = await self.redis.get_median_order_size(symbol)
-        if median_size == 0:
-            return large_orders
-        
-        # Проверяем заявки
-        for side, orders in [('bid', bids), ('ask', asks)]:
-            for price, size in orders[:20]:
-                ratio = size / median_size if median_size > 0 else 0
-                
-                if ratio >= 3:  # Крупная заявка
-                    large_orders.append({
-                        'side': side,
-                        'price': price,
-                        'size': size,
-                        'ratio': ratio,
-                        'category': self._get_category(ratio)
-                    })
-        
-        return large_orders
-    
-    def _get_category(self, ratio: float) -> str:
-        """Определить категорию заявки по размеру"""
-        if ratio >= 10:
-            return 'extreme'
-        elif ratio >= 5:
-            return 'very_large'
-        elif ratio >= 3:
-            return 'large'
-        return 'normal'
+        except Exception as e:
+            logger.debug(f"liquidity {symbol}: {e}")
+            return {"total_bid": 0, "total_ask": 0, "concentration": 0, "large_orders": []}
