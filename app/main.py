@@ -13,8 +13,8 @@ from app.config import config
 from app.utils.logger import logger
 from app.api.bybit_rest import BybitRestAPI
 from app.api.bybit_ws import BybitWebSocket
-from app.data.orderbook import OrderBookManager
-from app.data.trades import TradeAnalyzer
+from app.datasets.orderbook import OrderBookManager
+from app.datasets.trades import TradeAnalyzer
 from app.analysis.levels import LevelAnalyzer
 from app.analysis.absorption import AbsorptionDetector
 from app.analysis.rating import RatingCalculator
