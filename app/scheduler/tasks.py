@@ -15,11 +15,11 @@ class Scheduler:
         self.running = True
         logger.info("Scheduler started")
         
-        # Schedule tasks
         self.tasks = [
             asyncio.create_task(self._update_symbols_task()),
             asyncio.create_task(self._update_oi_task()),
             asyncio.create_task(self._update_funding_task()),
+            asyncio.create_task(self._update_candles_task()),
             asyncio.create_task(self._cleanup_task())
         ]
     
@@ -43,21 +43,25 @@ class Scheduler:
                 logger.error(f"Error in update symbols task: {e}")
     
     async def _update_oi_task(self):
-        """Update OI periodically"""
+        """Update OI periodically + save to DB"""
         while self.running:
             try:
-                await asyncio.sleep(60)  # Every minute
+                await asyncio.sleep(60)
                 
                 for symbol in self.bot.active_symbols:
                     if not self.running:
                         break
                     
                     oi_data = await self.bot.rest_api.get_oi(symbol)
-                    if oi_data:
+                    if oi_data and oi_data.get('oi', 0) > 0:
+                        # Сохраняем в Redis
                         await self.bot.redis.set_oi_data(symbol, oi_data)
-                        await self.bot.postgres.save_oi(symbol, oi_data['oi'])
+                        
+                        # Сохраняем в PostgreSQL
+                        if hasattr(self.bot, 'postgres') and self.bot.postgres:
+                            await self.bot.postgres.save_oi(symbol, oi_data['oi'])
                     
-                    await asyncio.sleep(0.1)  # Rate limiting
+                    await asyncio.sleep(0.1)
                     
             except asyncio.CancelledError:
                 break
@@ -65,10 +69,10 @@ class Scheduler:
                 logger.error(f"Error in OI update task: {e}")
     
     async def _update_funding_task(self):
-        """Update funding rates periodically"""
+        """Update funding rates periodically + save to DB"""
         while self.running:
             try:
-                await asyncio.sleep(300)  # Every 5 minutes
+                await asyncio.sleep(300)
                 
                 for symbol in self.bot.active_symbols:
                     if not self.running:
@@ -76,27 +80,54 @@ class Scheduler:
                     
                     funding_data = await self.bot.rest_api.get_funding_rate(symbol)
                     if funding_data:
+                        # Сохраняем в Redis
                         await self.bot.redis.set_funding_data(symbol, funding_data)
-                        await self.bot.postgres.save_funding(symbol, funding_data['funding_rate'])
+                        
+                        # Сохраняем в PostgreSQL
+                        if hasattr(self.bot, 'postgres') and self.bot.postgres:
+                            await self.bot.postgres.save_funding(
+                                symbol,
+                                funding_data['funding_rate'],
+                                funding_data.get('next_funding_time')
+                            )
                     
-                    await asyncio.sleep(0.1)  # Rate limiting
+                    await asyncio.sleep(0.1)
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in funding update task: {e}")
     
+    async def _update_candles_task(self):
+        """Update candles periodically + save to DB"""
+        while self.running:
+            try:
+                await asyncio.sleep(900)  # каждые 15 минут
+                
+                for symbol in self.bot.active_symbols:
+                    if not self.running:
+                        break
+                    
+                    # Загружаем свечи для 1H таймфрейма
+                    candles = await self.bot.rest_api.get_klines(symbol, '60', limit=100)
+                    
+                    if candles and hasattr(self.bot, 'postgres') and self.bot.postgres:
+                        for candle in candles:
+                            await self.bot.postgres.save_candle(symbol, '1H', candle)
+                    
+                    await asyncio.sleep(0.2)
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in candles update task: {e}")
+    
     async def _cleanup_task(self):
         """Cleanup old data periodically"""
         while self.running:
             try:
-                await asyncio.sleep(3600)  # Every hour
-                
-                # Clean old signals
-                # Clean old trades
-                # Clean old OI data
+                await asyncio.sleep(3600)
                 logger.info("Cleanup task executed")
-                
             except asyncio.CancelledError:
                 break
             except Exception as e:

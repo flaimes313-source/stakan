@@ -12,6 +12,7 @@ class OrderBookManager:
     def __init__(self, websocket: BybitWebSocket, redis: RedisStorage):
         self.ws = websocket
         self.redis = redis
+        self.postgres = None  # Будет установлен извне
         self.orderbooks: Dict[str, OrderBook] = {}
         self.orderbook_history: Dict[str, deque] = {}
         self.tracking: Dict[str, Dict] = {}
@@ -22,20 +23,23 @@ class OrderBookManager:
         self.ws.add_handler('orderbook', self._handle_orderbook_update)
         self.ws.add_handler('trade', self._handle_trade)
     
+    def set_postgres(self, postgres):
+        """Установить ссылку на PostgreSQL"""
+        self.postgres = postgres
+    
     async def _handle_orderbook_update(self, symbol: str, data: Dict):
         """Process orderbook update from WebSocket"""
         try:
             if 'data' in data and data['data']:
                 orderbook_data = data['data']
                 
-                # Parse bids and asks
                 bids = [
                     OrderBookEntry(
                         price=float(entry[0]),
                         size=float(entry[1]),
                         is_bid=True
                     )
-                    for entry in orderbook_data.get('b', [])[:50]  # Top 50 levels
+                    for entry in orderbook_data.get('b', [])[:50]
                 ]
                 
                 asks = [
@@ -47,7 +51,6 @@ class OrderBookManager:
                     for entry in orderbook_data.get('a', [])[:50]
                 ]
                 
-                # Create orderbook
                 orderbook = OrderBook(
                     symbol=symbol,
                     bids=bids,
@@ -55,17 +58,11 @@ class OrderBookManager:
                     timestamp=datetime.now()
                 )
                 
-                # Store in memory
                 async with self._lock:
                     self.orderbooks[symbol] = orderbook
                 
-                # Store in Redis
                 await self.redis.set_orderbook(symbol, orderbook)
-                
-                # Track large orders
                 await self._track_large_orders(symbol, orderbook)
-                
-                # Analyze orderbook
                 await self._analyze_orderbook(symbol, orderbook)
                 
         except Exception as e:
@@ -74,21 +71,18 @@ class OrderBookManager:
     async def _track_large_orders(self, symbol: str, orderbook: OrderBook):
         """Track large orders in the orderbook"""
         try:
-            # Get median order size from history
             median_size = await self.redis.get_median_order_size(symbol)
             if median_size == 0:
-                median_size = 1000  # Default if not set
+                median_size = 1000
             
-            # Check both sides
             for side, entries in [('bid', orderbook.bids), ('ask', orderbook.asks)]:
-                for entry in entries[:10]:  # Check top 10 levels
+                for entry in entries[:10]:
                     size_ratio = entry.size / median_size if median_size > 0 else 0
                     
                     if size_ratio >= config.ORDER_SIZE_THRESHOLDS['large']:
                         key = f"{symbol}:{side}:{entry.price}"
                         current_time = datetime.now()
                         
-                        # Check if we're already tracking this order
                         if key not in self.tracking:
                             self.tracking[key] = {
                                 'symbol': symbol,
@@ -99,24 +93,27 @@ class OrderBookManager:
                                 'initial_size': entry.size,
                                 'current_size': entry.size,
                                 'max_size': entry.size,
+                                'executed_estimate': 0,
+                                'cancelled_estimate': 0,
                                 'history': deque(maxlen=100),
                                 'notifications_sent': False
                             }
-                            # Save to Redis
+                            # Сохраняем в PostgreSQL
+                            if self.postgres:
+                                await self.postgres.save_large_order(self.tracking[key])
                             await self.redis.save_large_order(key, self.tracking[key])
                         else:
-                            # Update existing tracking
                             track = self.tracking[key]
                             track['last_seen'] = current_time
                             track['current_size'] = entry.size
                             track['max_size'] = max(track['max_size'], entry.size)
                             
-                            # Check for size reduction (possible execution)
                             if track['current_size'] < track['max_size'] * 0.8:
-                                # Significant reduction
                                 await self._check_order_reduction(track)
                             
-                            # Update Redis
+                            # Обновляем в PostgreSQL
+                            if self.postgres:
+                                await self.postgres.save_large_order(track)
                             await self.redis.save_large_order(key, track)
         
         except Exception as e:
@@ -125,10 +122,8 @@ class OrderBookManager:
     async def _check_order_reduction(self, track: Dict):
         """Check if order reduction is due to execution or cancellation"""
         try:
-            # Get recent trades for this symbol
             trades = await self.redis.get_recent_trades(track['symbol'], minutes=5)
             
-            # Calculate executed volume at this price level
             executed = sum(
                 t['size'] for t in trades
                 if abs(t['price'] - track['price']) < track['price'] * 0.001
@@ -136,9 +131,13 @@ class OrderBookManager:
             
             reduction = track['max_size'] - track['current_size']
             
-            if reduction > executed * 1.2:  # More reduction than executed
-                # Possible cancellation/spoofing
+            if reduction > executed * 1.2:
+                track['cancelled_estimate'] = reduction - executed
+                track['status'] = 'cancelled'
                 await self._handle_spoofing_signal(track)
+            else:
+                track['executed_estimate'] = executed
+                track['status'] = 'executed'
             
         except Exception as e:
             logger.error(f"Error checking order reduction: {e}")
@@ -156,14 +155,12 @@ class OrderBookManager:
             'timestamp': datetime.now()
         }
         
-        # Save to Redis
         await self.redis.save_signal(track['symbol'], signal_data)
         logger.warning(f"Possible spoofing detected: {track['symbol']} at {track['price']}")
     
     async def _analyze_orderbook(self, symbol: str, orderbook: OrderBook):
         """Analyze orderbook for imbalances and liquidity zones"""
         try:
-            # Calculate imbalance
             bid_volume = sum(b.size for b in orderbook.bids[:20])
             ask_volume = sum(a.size for a in orderbook.asks[:20])
             
@@ -172,13 +169,10 @@ class OrderBookManager:
             else:
                 imbalance = 0
             
-            # Store imbalance
             await self.redis.set_imbalance(symbol, imbalance)
             
-            # Find liquidity zones
             zones = await self._find_liquidity_zones(symbol, orderbook)
             
-            # Check if any significant zone exists
             median_size = await self.redis.get_median_order_size(symbol)
             if median_size == 0:
                 median_size = 1000
@@ -193,7 +187,7 @@ class OrderBookManager:
     async def _find_liquidity_zones(self, symbol: str, orderbook: OrderBook) -> List[Dict]:
         """Find liquidity zones in orderbook"""
         zones = []
-        price_threshold = orderbook.mid_price * 0.001  # 0.1% grouping
+        price_threshold = orderbook.mid_price * 0.001
         
         for side, entries in [('bid', orderbook.bids), ('ask', orderbook.asks)]:
             if not entries:
@@ -243,7 +237,6 @@ class OrderBookManager:
         
         await self.redis.save_signal(symbol, signal_data)
         
-        # Check if this zone matches any levels
         if zone['side'] == 'ask':
             await self._check_sell_wall(symbol, zone)
         else:
@@ -251,11 +244,9 @@ class OrderBookManager:
     
     async def _check_sell_wall(self, symbol: str, zone: Dict):
         """Check if liquidity zone is a sell wall"""
-        # Check if price is near recent highs
         levels = await self.redis.get_levels(symbol)
         for level in levels:
             if abs(level['price'] - zone['min_price']) < level['price'] * 0.005:
-                # Level matched
                 signal_data = {
                     'type': 'SELL_WALL',
                     'symbol': symbol,
@@ -290,13 +281,16 @@ class OrderBookManager:
                         'symbol': symbol,
                         'price': float(trade_data['p']),
                         'size': float(trade_data['v']),
-                        'side': trade_data['S'],  # 'Buy' or 'Sell'
+                        'side': trade_data['S'],
                         'timestamp': datetime.fromtimestamp(int(trade_data['T']) / 1000),
                         'notional': float(trade_data['p']) * float(trade_data['v'])
                     }
                     await self.redis.add_trade(symbol, trade)
+                    
+                    # Сохраняем в PostgreSQL (только крупные сделки > $10k)
+                    if self.postgres and trade['notional'] > 10000:
+                        await self.postgres.save_trade(symbol, trade)
                 
-                # Update volume stats
                 await self._update_volume_stats(symbol, data['data'])
                 
         except Exception as e:
@@ -305,7 +299,6 @@ class OrderBookManager:
     async def _update_volume_stats(self, symbol: str, trades: List[Dict]):
         """Update volume statistics"""
         try:
-            # Calculate buy/sell volume
             buy_volume = sum(
                 float(t['p']) * float(t['v']) 
                 for t in trades if t['S'] == 'Buy'
@@ -315,7 +308,6 @@ class OrderBookManager:
                 for t in trades if t['S'] == 'Sell'
             )
             
-            # Update Redis
             await self.redis.update_volume_stats(symbol, buy_volume, sell_volume)
             
         except Exception as e:
@@ -329,8 +321,6 @@ class OrderBookManager:
         """Start orderbook manager"""
         self.running = True
         logger.info("Orderbook manager started")
-        
-        # Start cleanup task
         asyncio.create_task(self._cleanup_task())
     
     async def stop(self):
@@ -341,14 +331,13 @@ class OrderBookManager:
     async def _cleanup_task(self):
         """Clean up old tracking data"""
         while self.running:
-            await asyncio.sleep(60)  # Run every minute
+            await asyncio.sleep(60)
             
             try:
                 current_time = datetime.now()
                 to_delete = []
                 
                 for key, track in self.tracking.items():
-                    # Remove orders older than 1 hour
                     if (current_time - track['last_seen']).total_seconds() > 3600:
                         to_delete.append(key)
                 
