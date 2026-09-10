@@ -159,7 +159,7 @@ class OrderBookManager:
                     "notional": price * size,
                 }
                 await self.store.add_trade(symbol, trade)
-                if self.postgres and trade["notional"] >= 50_000:
+                if self.postgres and trade["notional"] >= 5_000:
                     try:
                         await self.postgres.save_trade(symbol, trade)
                     except Exception as e:
