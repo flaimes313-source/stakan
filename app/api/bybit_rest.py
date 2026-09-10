@@ -96,7 +96,9 @@ class BybitRestAPI:
         try:
             result = await self._request('/v5/market/open-interest', params={
                 'category': 'linear',
-                'symbol': symbol
+                'symbol': symbol,
+                'intervalTime': '5min',
+                'limit': 1
             })
             if result and 'list' in result and result['list']:
                 return {
@@ -105,7 +107,7 @@ class BybitRestAPI:
                 }
             return {'oi': 0, 'timestamp': datetime.now()}
         except Exception as e:
-            logger.error(f"Error getting OI for {symbol}: {e}")
+            logger.debug(f"Error getting OI for {symbol}: {e}")
             return {'oi': 0, 'timestamp': datetime.now()}
     
     async def get_funding_rate(self, symbol: str) -> Dict:
@@ -126,7 +128,7 @@ class BybitRestAPI:
                 }
             return {'funding_rate': 0, 'next_funding_time': datetime.now(), 'timestamp': datetime.now()}
         except Exception as e:
-            logger.error(f"Error getting funding for {symbol}: {e}")
+            logger.debug(f"Error getting funding for {symbol}: {e}")
             return {'funding_rate': 0, 'next_funding_time': datetime.now(), 'timestamp': datetime.now()}
     
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
@@ -153,5 +155,5 @@ class BybitRestAPI:
                 return klines
             return []
         except Exception as e:
-            logger.error(f"Error getting klines for {symbol}: {e}")
+            logger.debug(f"Error getting klines for {symbol}: {e}")
             return []

@@ -14,18 +14,22 @@ class PostgresStorage:
         try:
             self.pool = await asyncpg.create_pool(
                 config.DATABASE_URL,
-                min_size=2,
-                max_size=10
+                min_size=1,
+                max_size=5,
+                timeout=10
             )
             await self._create_tables()
             self._connected = True
-            logger.info("Connected to PostgreSQL")
+            logger.info("✅ PostgreSQL connected")
         except Exception as e:
-            logger.error(f"PostgreSQL connection error: {e}")
+            logger.warning(f"⚠️ PostgreSQL unavailable: {e}. Working without DB.")
+            self.pool = None
             self._connected = False
     
     async def _create_tables(self):
         """Create all necessary tables"""
+        if not self.pool:
+            return
         async with self.pool.acquire() as conn:
             # 1. Symbols table
             await conn.execute("""
@@ -74,7 +78,7 @@ class PostgresStorage:
                 )
             """)
             
-            # 4. Orderbook events table (агрегированная история)
+            # 4. Orderbook events table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS orderbook_events (
                     id SERIAL PRIMARY KEY,
@@ -82,7 +86,7 @@ class PostgresStorage:
                     side VARCHAR(10) NOT NULL,
                     price DECIMAL(20,8) NOT NULL,
                     size DECIMAL(20,8) NOT NULL,
-                    event_type VARCHAR(20) NOT NULL, -- 'add', 'update', 'remove'
+                    event_type VARCHAR(20) NOT NULL,
                     timestamp TIMESTAMP NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -134,7 +138,7 @@ class PostgresStorage:
                     level DECIMAL(20,8),
                     score INTEGER NOT NULL,
                     state VARCHAR(20),
-                    signal_type VARCHAR(20), -- 'SETUP' or 'CONFIRMATION'
+                    signal_type VARCHAR(20),
                     factors JSONB,
                     message TEXT,
                     first_seen TIMESTAMP,
@@ -169,7 +173,7 @@ class PostgresStorage:
                 )
             """)
             
-            # 11. Large Orders Tracking table
+            # 11. Large Orders table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS large_orders (
                     id SERIAL PRIMARY KEY,
@@ -183,13 +187,13 @@ class PostgresStorage:
                     cancelled_estimate DECIMAL(20,8),
                     first_seen TIMESTAMP NOT NULL,
                     last_seen TIMESTAMP NOT NULL,
-                    status VARCHAR(20), -- 'active', 'executed', 'cancelled'
+                    status VARCHAR(20),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
-            # Create indexes
+            # Indexes
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_candles_symbol_timeframe 
                 ON candles(symbol, timeframe, timestamp DESC)
@@ -214,16 +218,12 @@ class PostgresStorage:
                 CREATE INDEX IF NOT EXISTS idx_large_orders_symbol 
                 ON large_orders(symbol, last_seen DESC)
             """)
-            
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_cvd_history_symbol 
-                ON cvd_history(symbol, timestamp DESC)
-            """)
     
     # ============ SAVE METHODS ============
     
     async def save_candle(self, symbol: str, timeframe: str, candle: Dict):
-        """Save candle data"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -241,10 +241,11 @@ class PostgresStorage:
                     candle['high'], candle['low'], candle['close'],
                     candle['volume'], candle['turnover'])
         except Exception as e:
-            logger.error(f"Error saving candle: {e}")
+            logger.debug(f"Error saving candle: {e}")
     
     async def save_level(self, symbol: str, level: Dict):
-        """Save level data"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -260,10 +261,11 @@ class PostgresStorage:
                     level['timeframe'], level['touches'],
                     level['volume'], level['type'] == 'support')
         except Exception as e:
-            logger.error(f"Error saving level: {e}")
+            logger.debug(f"Error saving level: {e}")
     
     async def save_trade(self, symbol: str, trade: Dict):
-        """Save trade data"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -272,10 +274,11 @@ class PostgresStorage:
                 """, symbol, trade['price'], trade['size'], 
                     trade['side'], trade['notional'], trade['timestamp'])
         except Exception as e:
-            logger.error(f"Error saving trade: {e}")
+            logger.debug(f"Error saving trade: {e}")
     
     async def save_oi(self, symbol: str, oi: float):
-        """Save OI data"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -283,10 +286,11 @@ class PostgresStorage:
                     VALUES ($1, $2, $3)
                 """, symbol, oi, datetime.now())
         except Exception as e:
-            logger.error(f"Error saving OI: {e}")
+            logger.debug(f"Error saving OI: {e}")
     
     async def save_funding(self, symbol: str, funding_rate: float, next_funding_time: datetime = None):
-        """Save funding data"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -294,10 +298,11 @@ class PostgresStorage:
                     VALUES ($1, $2, $3, $4)
                 """, symbol, funding_rate, next_funding_time, datetime.now())
         except Exception as e:
-            logger.error(f"Error saving funding: {e}")
+            logger.debug(f"Error saving funding: {e}")
     
     async def save_signal(self, signal) -> int:
-        """Save signal to database"""
+        if not self.pool:
+            return 0
         try:
             async with self.pool.acquire() as conn:
                 result = await conn.fetchrow("""
@@ -305,15 +310,16 @@ class PostgresStorage:
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     RETURNING id
                 """, signal.symbol, signal.direction, signal.level, signal.score,
-                    signal.state.value, signal.signal_type if hasattr(signal, 'signal_type') else 'SETUP',
+                    signal.state.value, 'SETUP',
                     signal.factors, signal.message, signal.timestamp, signal.timestamp)
                 return result['id'] if result else 0
         except Exception as e:
-            logger.error(f"Error saving signal: {e}")
+            logger.debug(f"Error saving signal: {e}")
             return 0
     
     async def update_signal(self, signal_id: int, data: Dict):
-        """Update signal"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -323,10 +329,11 @@ class PostgresStorage:
                 """, data.get('score'), data.get('state'), data.get('message'),
                     data.get('factors'), data.get('last_alert'), signal_id)
         except Exception as e:
-            logger.error(f"Error updating signal: {e}")
+            logger.debug(f"Error updating signal: {e}")
     
     async def save_signal_event(self, signal_id: int, event_type: str, old_state: str, new_state: str, score_change: int = 0, details: Dict = None):
-        """Save signal event"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -334,10 +341,11 @@ class PostgresStorage:
                     VALUES ($1, $2, $3, $4, $5, $6)
                 """, signal_id, event_type, old_state, new_state, score_change, details)
         except Exception as e:
-            logger.error(f"Error saving signal event: {e}")
+            logger.debug(f"Error saving signal event: {e}")
     
     async def save_large_order(self, order_data: Dict):
-        """Save large order tracking"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -358,10 +366,11 @@ class PostgresStorage:
                     order_data.get('executed_estimate'), order_data.get('cancelled_estimate'),
                     order_data['first_seen'], order_data['last_seen'], order_data.get('status', 'active'))
         except Exception as e:
-            logger.error(f"Error saving large order: {e}")
+            logger.debug(f"Error saving large order: {e}")
     
     async def save_cvd(self, symbol: str, cvd: float):
-        """Save CVD data"""
+        if not self.pool:
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("""
@@ -369,12 +378,13 @@ class PostgresStorage:
                     VALUES ($1, $2, $3)
                 """, symbol, cvd, datetime.now())
         except Exception as e:
-            logger.error(f"Error saving CVD: {e}")
+            logger.debug(f"Error saving CVD: {e}")
     
     # ============ GET METHODS ============
     
     async def get_recent_signals(self, symbol: str = None, limit: int = 50) -> List[Dict]:
-        """Get recent signals"""
+        if not self.pool:
+            return []
         try:
             async with self.pool.acquire() as conn:
                 if symbol:
@@ -388,15 +398,16 @@ class PostgresStorage:
                     rows = await conn.fetch("""
                         SELECT * FROM signals
                         ORDER BY created_at DESC
-                        LIMIT $2
+                        LIMIT $1
                     """, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error getting signals: {e}")
+            logger.debug(f"Error getting signals: {e}")
             return []
     
     async def get_cvd_history(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """Get CVD history"""
+        if not self.pool:
+            return []
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch("""
@@ -407,11 +418,12 @@ class PostgresStorage:
                 """, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error getting CVD history: {e}")
+            logger.debug(f"Error getting CVD history: {e}")
             return []
     
     async def get_large_orders(self, symbol: str = None, status: str = 'active') -> List[Dict]:
-        """Get large orders"""
+        if not self.pool:
+            return []
         try:
             async with self.pool.acquire() as conn:
                 if symbol:
@@ -429,11 +441,12 @@ class PostgresStorage:
                     """, status)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error getting large orders: {e}")
+            logger.debug(f"Error getting large orders: {e}")
             return []
     
     async def get_oi_history(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """Get OI history"""
+        if not self.pool:
+            return []
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch("""
@@ -444,11 +457,12 @@ class PostgresStorage:
                 """, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error getting OI history: {e}")
+            logger.debug(f"Error getting OI history: {e}")
             return []
     
     async def get_funding_history(self, symbol: str, limit: int = 50) -> List[Dict]:
-        """Get funding history"""
+        if not self.pool:
+            return []
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch("""
@@ -459,11 +473,12 @@ class PostgresStorage:
                 """, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error getting funding history: {e}")
+            logger.debug(f"Error getting funding history: {e}")
             return []
     
     async def get_candles(self, symbol: str, timeframe: str, limit: int = 200) -> List[Dict]:
-        """Get candles"""
+        if not self.pool:
+            return []
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch("""
@@ -474,7 +489,7 @@ class PostgresStorage:
                 """, symbol, timeframe, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error getting candles: {e}")
+            logger.debug(f"Error getting candles: {e}")
             return []
     
     async def close(self):
