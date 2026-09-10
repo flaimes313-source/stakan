@@ -2,12 +2,11 @@ import os
 from typing import List
 from dotenv import load_dotenv, find_dotenv
 
-# Ищем .env вверх по дереву от текущего файла — надёжнее, чем фиксированный путь
+# Ищем .env вверх по дереву от текущего файла
 _env_file = find_dotenv(usecwd=False)
 if _env_file:
     load_dotenv(_env_file, override=False)
 else:
-    # Fallback: корень проекта
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     load_dotenv(os.path.join(_root, ".env"), override=False)
 
@@ -22,14 +21,18 @@ def _int(v, default=0):
 class Config:
     # ===== Telegram =====
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+
+    # ADMIN_IDS — необязателен.
+    # Если пусто — подписчики собираются автоматически через /start.
+    _admin_raw: str = os.getenv("ADMIN_IDS", "").strip()
     ADMIN_IDS: List[int] = [
-        int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+        int(x) for x in _admin_raw.split(",") if x.strip().isdigit()
     ]
 
     # ===== PostgreSQL =====
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
-    # ===== Redis (опционально — есть fallback на файл) =====
+    # ===== Redis (опционально — есть fallback на FileStore) =====
     REDIS_URL: str = os.getenv("REDIS_URL", "")
     REDIS_HOST: str = os.getenv("REDIS_HOST", "")
     REDIS_PORT: int = _int(os.getenv("REDIS_PORT", "0"))
@@ -53,8 +56,13 @@ class Config:
     SIGNAL_THRESHOLD: int = 70
 
     WEIGHTS = {
-        "level": 20, "orderbook": 20, "trades": 15,
-        "absorption": 20, "oi": 10, "funding": 5, "volume": 10,
+        "level": 20,
+        "orderbook": 20,
+        "trades": 15,
+        "absorption": 20,
+        "oi": 10,
+        "funding": 5,
+        "volume": 10,
     }
 
     TIMEFRAMES = {
@@ -64,9 +72,12 @@ class Config:
         "15":  {"weight": 1, "limit": 200},
     }
 
-    ORDER_SIZE_THRESHOLDS = {"large": 3.0, "very_large": 5.0, "extreme": 10.0}
+    ORDER_SIZE_THRESHOLDS = {
+        "large": 3.0,
+        "very_large": 5.0,
+        "extreme": 10.0,
+    }
 
-    # Redis используется только если явно задан
     @property
     def use_redis(self) -> bool:
         return bool(self.REDIS_URL or (self.REDIS_HOST and self.REDIS_PORT))
@@ -75,10 +86,9 @@ class Config:
         errors = []
         if not self.BOT_TOKEN:
             errors.append("BOT_TOKEN не задан")
-        if not self.ADMIN_IDS:
-            errors.append("ADMIN_IDS не задан")
         if not self.DATABASE_URL:
             errors.append("DATABASE_URL не задан (PostgreSQL обязателен)")
+        # ADMIN_IDS не проверяем — он необязателен
         if errors:
             raise RuntimeError("Ошибки конфигурации:\n  - " + "\n  - ".join(errors))
 

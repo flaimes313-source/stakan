@@ -1,10 +1,6 @@
-"""
-Telegram-уведомления и команды.
-Использует глобальный app для доступа к состоянию.
-"""
 import asyncio
 from datetime import datetime
-from typing import Optional, List
+from typing import List, Optional, Set
 
 from aiogram import Bot, Dispatcher, types
 
@@ -13,43 +9,89 @@ from app.utils.logger import logger
 
 
 class TelegramNotifier:
+    SUBSCRIBERS_KEY = "telegram_subscribers"
+
     def __init__(self):
         self.bot = Bot(token=config.BOT_TOKEN)
         self.dp = Dispatcher(self.bot)
         self.app = None
+
+        self._subscribers: Set[int] = set()
+        self._muted: Set[int] = set()
+        self._loaded = False
+
         self._register()
 
     def set_app(self, app):
         self.app = app
+
+    # ========== ХРАНИЛИЩЕ ПОДПИСЧИКОВ ==========
+
+    async def _load_subscribers(self):
+        if self._loaded or not self.app:
+            return
+        try:
+            data = await self.app.store._get(self.SUBSCRIBERS_KEY)
+            if isinstance(data, list):
+                self._subscribers = set(int(x) for x in data)
+        except Exception as e:
+            logger.debug(f"load_subscribers: {e}")
+        self._loaded = True
+
+    async def _save_subscribers(self):
+        if not self.app:
+            return
+        try:
+            await self.app.store._set(
+                self.SUBSCRIBERS_KEY, sorted(self._subscribers), ttl=None
+            )
+        except Exception as e:
+            logger.debug(f"save_subscribers: {e}")
 
     # ========== КОМАНДЫ ==========
 
     def _register(self):
         @self.dp.message_handler(commands=["start"])
         async def cmd_start(m: types.Message):
+            uid = m.from_user.id
+            await self._load_subscribers()
+            self._subscribers.add(uid)
+            await self._save_subscribers()
             await m.reply(
                 "🤖 Market Analysis Bot\n\n"
-                "Анализирую ликвидные USDT-перпы Bybit в реальном времени.\n\n"
+                "✅ Ты подписан на сигналы.\n\n"
                 "Команды:\n"
-                "/status — состояние бота\n"
-                "/top — топ-10 активных монет\n"
-                "/coins — список отслеживаемых\n"
+                "/status — состояние\n"
+                "/top — топ-10 монет\n"
+                "/coins — список монет\n"
                 "/signals — последние сигналы\n"
                 "/mute — вкл/выкл уведомления\n"
-                "/settings — текущие настройки\n"
+                "/stop — отписаться от сигналов\n"
+                "/settings — настройки\n"
             )
+
+        @self.dp.message_handler(commands=["stop"])
+        async def cmd_stop(m: types.Message):
+            uid = m.from_user.id
+            await self._load_subscribers()
+            self._subscribers.discard(uid)
+            await self._save_subscribers()
+            await m.reply("🔕 Ты отписан от сигналов. Вернуться — /start")
 
         @self.dp.message_handler(commands=["status"])
         async def cmd_status(m: types.Message):
             if not self.app:
                 await m.reply("Бот инициализируется…")
                 return
+            db_ok = "OK" if self.app.postgres._connected else "FAIL"
+            store = "Redis" if config.use_redis else "FileStore"
             s = (
                 f"📊 Статус\n"
                 f"🕐 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
                 f"📈 Монет: {len(self.app.active_symbols)}\n"
-                f"💾 БД: {'OK' if self.app.postgres._connected else 'FAIL'}\n"
-                f"🗄 Хранилище: {'Redis' if config.use_redis else 'FileStore'}"
+                f"💾 БД: {db_ok}\n"
+                f"🗄 Хранилище: {store}\n"
+                f"👥 Подписчиков: {len(self._subscribers)}"
             )
             await m.reply(s)
 
@@ -100,12 +142,12 @@ class TelegramNotifier:
         @self.dp.message_handler(commands=["mute"])
         async def cmd_mute(m: types.Message):
             uid = m.from_user.id
-            if uid not in self._muted:
-                self._muted.add(uid)
-                await m.reply("🔕 Уведомления выключены")
-            else:
+            if uid in self._muted:
                 self._muted.discard(uid)
                 await m.reply("🔔 Уведомления включены")
+            else:
+                self._muted.add(uid)
+                await m.reply("🔕 Уведомления выключены (подписка остаётся)")
 
         @self.dp.message_handler(commands=["settings"])
         async def cmd_settings(m: types.Message):
@@ -119,14 +161,19 @@ class TelegramNotifier:
             )
             await m.reply(s)
 
-    _muted: set = set()
-
     # ========== ОТПРАВКА ==========
 
     async def send(self, message: str, user_ids: Optional[List[int]] = None):
-        if not user_ids:
-            user_ids = [aid for aid in config.ADMIN_IDS if aid not in self._muted]
-        for uid in user_ids:
+        await self._load_subscribers()
+
+        if user_ids is None:
+            recipients = set(self._subscribers)
+            recipients.update(config.ADMIN_IDS)
+            recipients -= self._muted
+        else:
+            recipients = set(user_ids) - self._muted
+
+        for uid in recipients:
             try:
                 await self.bot.send_message(uid, message)
                 await asyncio.sleep(0.05)
@@ -134,7 +181,8 @@ class TelegramNotifier:
                 logger.error(f"send to {uid}: {e}")
 
     async def start(self):
-        logger.info("Telegram bot started")
+        await self._load_subscribers()
+        logger.info(f"Telegram bot started, subscribers: {len(self._subscribers)}")
         await self.dp.start_polling()
 
     async def stop(self):
