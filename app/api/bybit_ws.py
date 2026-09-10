@@ -89,8 +89,8 @@ class BybitWebSocket:
             try:
                 async with websockets.connect(
                     self.ws_url,
-                    ping_interval=20,
-                    ping_timeout=20,
+                    ping_interval=30,
+                    ping_timeout=60,
                     close_timeout=10,
                     max_size=2**23,      # 8 МБ на пакет
                 ) as ws:

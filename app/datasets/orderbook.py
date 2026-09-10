@@ -1,9 +1,3 @@
-"""
-Локальная книга заявок по правилам Bybit V5:
-  - snapshot: полная замена
-  - delta: применяем к локальной книге
-  - update_id (u) и seq — для контроля
-"""
 import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
@@ -22,7 +16,7 @@ class OrderBookManager:
         self.store = store
         self.postgres = None
 
-        # symbol -> {"bids": {price: size}, "asks": {price: size}, "u": int, "ts": datetime}
+        # symbol -> {"bids": {price: size}, "asks": {price: size}, "u": int, "seq": int, "ts": datetime}
         self._books: Dict[str, Dict] = {}
 
         self.running = False
@@ -31,12 +25,9 @@ class OrderBookManager:
         self.ws.add_handler("orderbook", self._on_orderbook)
         self.ws.add_handler("trade", self._on_trade)
 
-        # медиана размера ордера
         self._order_sizes: Dict[str, deque] = {}
         self._order_sizes_max = 500
-        self._last_median_update: Dict[str, datetime] = {}
 
-        # крупные заявки
         self.tracking: Dict[str, Dict] = {}
 
     def set_postgres(self, postgres):
@@ -52,21 +43,45 @@ class OrderBookManager:
         self.running = False
         logger.info("OrderBook manager stopped")
 
-    # ========== ОБРАБОТКА ORDERBOOK ==========
+    # ========== ORDERBOOK ==========
 
     async def _on_orderbook(self, symbol: str, msg: Dict):
         try:
-            data = msg.get("data") or {}
-            msg_type = msg.get("type")  # snapshot | delta
-            update_id = int(data.get("u", 0))
-            seq = int(data.get("seq", 0))
+            data = msg.get("data")
+            if not data:
+                return
+
+            msg_type = msg.get("type")
+            update_id = int(data.get("u", 0) or 0)
+            seq = int(data.get("seq", 0) or 0)
+
+            b_raw = data.get("b") or []
+            a_raw = data.get("a") or []
+
+            # Пустой пакет без изменений — не трогаем книгу
+            if not b_raw and not a_raw and msg_type != "snapshot":
+                return
 
             async with self._lock:
                 book = self._books.get(symbol)
 
                 if msg_type == "snapshot" or book is None:
-                    bids = {float(p): float(s) for p, s in data.get("b", [])}
-                    asks = {float(p): float(s) for p, s in data.get("a", [])}
+                    bids = {}
+                    asks = {}
+                    for p, s in b_raw:
+                        try:
+                            size = float(s)
+                            if size > 0:
+                                bids[float(p)] = size
+                        except (TypeError, ValueError):
+                            continue
+                    for p, s in a_raw:
+                        try:
+                            size = float(s)
+                            if size > 0:
+                                asks[float(p)] = size
+                        except (TypeError, ValueError):
+                            continue
                     self._books[symbol] = {
                         "bids": bids,
                         "asks": asks,
@@ -75,25 +90,26 @@ class OrderBookManager:
                         "ts": datetime.now(),
                     }
                 else:
-                    # delta — проверяем преемственность
-                    if update_id <= book["u"]:
+                    if update_id and update_id <= book["u"]:
                         return
-                    self._apply_side(book["bids"], data.get("b", []))
-                    self._apply_side(book["asks"], data.get("a", []))
+                    self._apply_side(book["bids"], b_raw)
+                    self._apply_side(book["asks"], a_raw)
                     book["u"] = update_id
                     book["seq"] = seq
                     book["ts"] = datetime.now()
 
-                # Собираем топ-50
                 top_bids = sorted(book["bids"].items(), key=lambda x: -x[0])[: config.ORDERBOOK_DEPTH]
                 top_asks = sorted(book["asks"].items(), key=lambda x: x[0])[: config.ORDERBOOK_DEPTH]
 
+            if not top_bids or not top_asks:
+                return
+
             orderbook = OrderBook(
                 symbol=symbol,
-                bids=[OrderBookEntry(price=p, size=s) for p, s in top_bids if s > 0],
-                asks=[OrderBookEntry(price=p, size=s) for p, s in top_asks if s > 0],
-                timestamp=book["ts"],
-                update_id=book["u"],
+                bids=[OrderBookEntry(price=p, size=s) for p, s in top_bids],
+                asks=[OrderBookEntry(price=p, size=s) for p, s in top_asks],
+                timestamp=self._books[symbol]["ts"],
+                update_id=self._books[symbol]["u"],
                 is_snapshot=(msg_type == "snapshot"),
             )
 
@@ -101,45 +117,57 @@ class OrderBookManager:
             await self._track_large_orders(symbol, orderbook)
             await self._analyze(symbol, orderbook)
 
-            # обновляем медиану размера ордера
             for _, size in top_bids[:20]:
                 self._order_sizes.setdefault(symbol, deque(maxlen=self._order_sizes_max)).append(size)
             for _, size in top_asks[:20]:
                 self._order_sizes.setdefault(symbol, deque(maxlen=self._order_sizes_max)).append(size)
 
         except Exception as e:
-            logger.error(f"orderbook error {symbol}: {e}")
+            logger.debug(f"orderbook skip {symbol}: {e}")
 
-    def _apply_side(self, side: Dict[float, float], updates: List[List]):
-        for p_str, s_str in updates:
-            price = float(p_str)
-            size = float(s_str)
+    def _apply_side(self, side: Dict[float, float], updates):
+        if not updates:
+            return
+        for row in updates:
+            try:
+                price = float(row[0])
+                size = float(row[1])
+            except (TypeError, ValueError, IndexError):
+                continue
             if size == 0:
                 side.pop(price, None)
             else:
                 side[price] = size
 
-    # ========== СДЕЛКИ ==========
+    # ========== TRADES ==========
 
     async def _on_trade(self, symbol: str, msg: Dict):
         try:
             trades = msg.get("data") or []
             for t in trades:
+                try:
+                    price = float(t["p"])
+                    size = float(t["v"])
+                except (KeyError, TypeError, ValueError):
+                    continue
                 trade = {
                     "symbol": symbol,
-                    "price": float(t["p"]),
-                    "size": float(t["v"]),
-                    "side": t["S"],                         # "Buy" / "Sell"
+                    "price": price,
+                    "size": size,
+                    "side": t.get("S", "Buy"),
                     "timestamp": datetime.fromtimestamp(int(t["T"]) / 1000),
-                    "notional": float(t["p"]) * float(t["v"]),
+                    "notional": price * size,
                 }
                 await self.store.add_trade(symbol, trade)
                 if self.postgres and trade["notional"] >= 50_000:
-                    await self.postgres.save_trade(symbol, trade)
+                    try:
+                        await self.postgres.save_trade(symbol, trade)
+                    except Exception as e:
+                        logger.debug(f"save_trade {symbol}: {e}")
         except Exception as e:
-            logger.error(f"trade error {symbol}: {e}")
+            logger.debug(f"trade skip {symbol}: {e}")
 
-    # ========== МЕДИАНА ==========
+    # ========== MEDIAN ==========
 
     async def _median_updater(self):
         while self.running:
@@ -156,7 +184,7 @@ class OrderBookManager:
             except Exception as e:
                 logger.error(f"median updater: {e}")
 
-    # ========== КРУПНЫЕ ЗАЯВКИ ==========
+    # ========== LARGE ORDERS ==========
 
     async def _track_large_orders(self, symbol: str, ob: OrderBook):
         try:
@@ -165,7 +193,7 @@ class OrderBookManager:
                 return
 
             now = datetime.now()
-            session_id = int(now.timestamp() // 3600)  # новая сессия каждый час
+            session_id = int(now.timestamp() // 3600)
 
             for side, entries in (("bid", ob.bids), ("ask", ob.asks)):
                 for e in entries[:10]:
@@ -197,13 +225,16 @@ class OrderBookManager:
                         rec["max_size"] = max(rec["max_size"], e.size)
 
                     if self.postgres:
-                        await self.postgres.save_large_order(rec)
+                        try:
+                            await self.postgres.save_large_order(rec)
+                        except Exception as e:
+                            logger.debug(f"save_large_order {symbol}: {e}")
                     await self.store.save_large_order(key, rec)
 
         except Exception as e:
-            logger.error(f"track_large_orders: {e}")
+            logger.debug(f"track_large_orders {symbol}: {e}")
 
-    # ========== АНАЛИЗ ==========
+    # ========== ANALYZE ==========
 
     async def _analyze(self, symbol: str, ob: OrderBook):
         if not ob.bids or not ob.asks:
@@ -216,7 +247,7 @@ class OrderBookManager:
         imbalance = (bid_vol - ask_vol) / total
         await self.store.set_imbalance(symbol, imbalance)
 
-    # ========== ОЧИСТКА ==========
+    # ========== CLEANUP ==========
 
     async def _cleanup_task(self):
         while self.running:
@@ -232,8 +263,6 @@ class OrderBookManager:
                 break
             except Exception as e:
                 logger.error(f"cleanup: {e}")
-
-    # ========== ДОСТУП ==========
 
     def get_local_book(self, symbol: str) -> Optional[Dict]:
         return self._books.get(symbol)
