@@ -26,6 +26,8 @@ class Scheduler:
             asyncio.create_task(self._levels_loop(), name="levels_loop"),
         ]
         logger.info("Scheduler started")
+        # Проверка, что список символов уже есть
+        logger.info(f"Scheduler: active_symbols={len(self.app.active_symbols)}")
 
     async def stop(self):
         self.running = False
@@ -43,13 +45,15 @@ class Scheduler:
                 if not self.running:
                     break
                 await self.app.market_data.refresh_symbols()
+                logger.info(f"symbols_loop: обновлено {len(self.app.active_symbols)} символов")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"symbols_loop: {e}")
-                await asyncio.sleep(30)   # не выходим
+                await asyncio.sleep(30)
 
     async def _oi_loop(self):
+        logger.info("oi_loop: старт")
         while self.running:
             try:
                 await asyncio.sleep(60)
@@ -58,8 +62,10 @@ class Scheduler:
 
                 symbols = list(self.app.active_symbols)
                 if not symbols:
-                    logger.debug("oi_loop: пустой список символов")
+                    logger.warning("oi_loop: пустой список символов")
                     continue
+
+                logger.info(f"oi_loop: начало цикла по {len(symbols)} символам")
 
                 ok, err = 0, 0
                 for s in symbols:
@@ -73,21 +79,25 @@ class Scheduler:
                                 await self.app.postgres.save_oi(s, data["oi"])
                                 ok += 1
                             except Exception as e:
-                                logger.debug(f"save_oi {s}: {e}")
+                                logger.warning(f"save_oi {s}: {e}")
+                        else:
+                            err += 1
+                            logger.warning(f"oi_loop: пустой ответ для {s}")
                     except Exception as e:
                         err += 1
-                        logger.debug(f"oi {s}: {e}")
+                        logger.warning(f"oi_loop: {s}: {e}")
                     await asyncio.sleep(0.1)
 
-                logger.debug(f"oi_loop: ok={ok}, errors={err}")
+                logger.info(f"oi_loop: ok={ok}, errors={err}")
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"oi_loop: {e}")
-                await asyncio.sleep(15)   # не выходим
+                await asyncio.sleep(15)
 
     async def _funding_loop(self):
+        logger.info("funding_loop: старт")
         while self.running:
             try:
                 await asyncio.sleep(300)
@@ -96,9 +106,12 @@ class Scheduler:
 
                 symbols = list(self.app.active_symbols)
                 if not symbols:
+                    logger.warning("funding_loop: пустой список символов")
                     continue
 
-                ok = 0
+                logger.info(f"funding_loop: начало цикла по {len(symbols)} символам")
+
+                ok, err = 0, 0
                 for s in symbols:
                     if not self.running:
                         break
@@ -112,18 +125,21 @@ class Scheduler:
                                 )
                                 ok += 1
                             except Exception as e:
-                                logger.debug(f"save_funding {s}: {e}")
+                                logger.warning(f"save_funding {s}: {e}")
+                        else:
+                            err += 1
                     except Exception as e:
-                        logger.debug(f"funding {s}: {e}")
+                        err += 1
+                        logger.warning(f"funding_loop: {s}: {e}")
                     await asyncio.sleep(0.1)
 
-                logger.debug(f"funding_loop: saved={ok}")
+                logger.info(f"funding_loop: ok={ok}, errors={err}")
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"funding_loop: {e}")
-                await asyncio.sleep(30)   # не выходим
+                await asyncio.sleep(30)
 
     async def _candles_loop(self):
         while self.running:
@@ -133,6 +149,7 @@ class Scheduler:
                     break
 
                 symbols = list(self.app.active_symbols)
+                ok = 0
                 for s in symbols:
                     if not self.running:
                         break
@@ -141,35 +158,44 @@ class Scheduler:
                         for c in candles:
                             try:
                                 await self.app.postgres.save_candle(s, "60", c)
+                                ok += 1
                             except Exception:
                                 pass
                     except Exception as e:
-                        logger.debug(f"candles {s}: {e}")
+                        logger.warning(f"candles_loop: {s}: {e}")
                     await asyncio.sleep(0.2)
+                logger.info(f"candles_loop: сохранено {ok} свечей")
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"candles_loop: {e}")
-                await asyncio.sleep(30)   # не выходим
+                await asyncio.sleep(30)
 
     async def _levels_loop(self):
-        # Первый прогон — сразу, потом каждые 5 минут
         while self.running:
             try:
                 symbols = list(self.app.active_symbols)
+                if not symbols:
+                    logger.warning("levels_loop: пустой список символов")
+                    await asyncio.sleep(30)
+                    continue
+
+                ok = 0
                 for s in symbols:
                     if not self.running:
                         break
                     try:
                         await self.app.levels.update_levels_for_symbol(s)
+                        ok += 1
                     except Exception as e:
-                        logger.debug(f"levels {s}: {e}")
+                        logger.warning(f"levels_loop: {s}: {e}")
                     await asyncio.sleep(0.15)
+                logger.info(f"levels_loop: обновлено {ok} монет")
                 await asyncio.sleep(300)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"levels_loop: {e}")
-                await asyncio.sleep(30)   # не выходим
+                await asyncio.sleep(30)
