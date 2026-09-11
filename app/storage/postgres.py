@@ -152,8 +152,11 @@ class PostgresStorage:
             return
         async with self.pool.acquire() as c:
             await c.execute(
-                "INSERT INTO oi_history(symbol, oi) VALUES ($1, $2)",
-                symbol, float(oi),
+                """
+                INSERT INTO oi_history(symbol, oi, timestamp)
+                VALUES ($1, $2, $3)
+                """,
+                symbol, float(oi), datetime.now(),
             )
 
     async def save_funding(self, symbol: str, funding_rate: float, next_funding_time: Optional[datetime] = None):
@@ -161,13 +164,17 @@ class PostgresStorage:
             return
         async with self.pool.acquire() as c:
             await c.execute(
-                "INSERT INTO funding_history(symbol, funding_rate, next_funding_time) VALUES ($1, $2, $3)",
-                symbol, float(funding_rate), next_funding_time,
+                """
+                INSERT INTO funding_history(symbol, funding_rate, next_funding_time, timestamp)
+                VALUES ($1, $2, $3, $4)
+                """,
+                symbol, float(funding_rate), next_funding_time, datetime.now(),
             )
 
     async def save_signal(self, signal) -> int:
         if not self.pool:
             return 0
+        import json
         async with self.pool.acquire() as c:
             row = await c.fetchrow(
                 """
@@ -178,7 +185,7 @@ class PostgresStorage:
                 signal.symbol, signal.direction, signal.level, signal.score,
                 signal.state.value if hasattr(signal.state, "value") else str(signal.state),
                 signal.signal_type.value if hasattr(signal.signal_type, "value") else str(signal.signal_type),
-                __import__("json").dumps(signal.factors, default=str),
+                json.dumps(signal.factors, default=str),
                 signal.message,
             )
             return row["id"] if row else 0
