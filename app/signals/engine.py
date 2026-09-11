@@ -4,6 +4,12 @@ Signal Engine:
 2. Прогоняем анализаторы: absorption, liquidity, OI, funding, volume.
 3. Считаем рейтинг.
 4. Если total >= SIGNAL_THRESHOLD и memory разрешает — отправляем.
+
+Направление сигнала определяется:
+- в первую очередь через поглощение (absorption);
+- если поглощения нет — через fallback:
+  * сильный imbalance стакана (> 30%);
+  * крупная дельта за 15м (> $1M).
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -42,10 +48,13 @@ class SignalEngine:
         self.memory = SignalMemory(store)
 
         self.running = False
-        self._notifier = None  # установится снаружи
+        self._notifier = None
 
-        # объём: скользящий стакан
         self._volume_avg: Dict[str, float] = {}
+
+        # Пороги fallback
+        self.FALLBACK_IMBALANCE = 0.30     # 30% перевес в стакане
+        self.FALLBACK_DELTA_USD = 1_000_000  # $1M за 15м
 
     def set_notifier(self, notifier):
         self._notifier = notifier
@@ -73,7 +82,7 @@ class SignalEngine:
                         await self.analyze(symbol)
                     except Exception as e:
                         logger.error(f"analyze {symbol}: {e}")
-                    await asyncio.sleep(0.05)  # мягкая пауза
+                    await asyncio.sleep(0.05)
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
@@ -88,33 +97,20 @@ class SignalEngine:
         if not ob or not ob.get("bids") or not ob.get("asks"):
             return None
 
-        # Обновляем CVD по новым сделкам
         await self.trades.update_cvd_from_trades(symbol)
         cvd = await self.trades.get_cvd(symbol)
-
-        # Delta за 15 мин
         delta = await self.trades.delta_window(symbol, seconds=900)
 
-        # Поглощение
         absorption = await self.absorption.detect(symbol)
-
-        # Ликвидность
         liquidity = await self.liquidity.analyze(symbol)
-
-        # Уровни
         levels = await self.store.get_levels(symbol)
-
-        # OI
         oi = await self.oi.analyze(symbol)
 
-        # Funding
         funding_data = await self.store.get_funding_data(symbol)
         funding = await self.funding.analyze(symbol, funding_data.get("funding_rate", 0))
 
-        # Объём: текущий vs средний за 1ч
         volume_ratio = await self._volume_ratio(symbol)
 
-        # Рейтинг
         rating = await self.rating.calculate(
             symbol=symbol,
             orderbook=ob,
@@ -134,22 +130,37 @@ class SignalEngine:
         if total < config.SIGNAL_THRESHOLD:
             return None
 
+        # ===== ОПРЕДЕЛЕНИЕ НАПРАВЛЕНИЯ =====
         direction = rating["direction"]
+
+        # Fallback 1: сильный imbalance стакана
         if direction == "NEUTRAL":
-            # Без направления сигнал не шлём
+            liq_total = liquidity.get("total_bid", 0) + liquidity.get("total_ask", 0)
+            if liq_total > 0:
+                imbalance_pct = (liquidity["total_bid"] - liquidity["total_ask"]) / liq_total
+                if imbalance_pct > self.FALLBACK_IMBALANCE:
+                    direction = "LONG"
+                    logger.debug(f"{symbol}: direction=LONG (imbalance {imbalance_pct:.2f})")
+                elif imbalance_pct < -self.FALLBACK_IMBALANCE:
+                    direction = "SHORT"
+                    logger.debug(f"{symbol}: direction=SHORT (imbalance {imbalance_pct:.2f})")
+
+        # Fallback 2: крупная дельта
+        if direction == "NEUTRAL" and abs(delta.get("delta", 0)) > self.FALLBACK_DELTA_USD:
+            direction = "LONG" if delta["delta"] > 0 else "SHORT"
+            logger.debug(f"{symbol}: direction={direction} (delta {delta['delta']:+,.0f})")
+
+        if direction == "NEUTRAL":
             return None
 
-        # Определим ближайший уровень
         level_price = 0.0
         if levels:
             level_price = levels[0]["price"]
 
-        # Анти-спам
         allowed = await self.memory.should_send(symbol, direction, total, level_price)
         if not allowed:
             return None
 
-        # Собираем сообщение
         message = self._format_message(
             symbol=symbol,
             direction=direction,
@@ -176,11 +187,9 @@ class SignalEngine:
             message=message,
         )
 
-        # Отправка
         if self._notifier:
             await self._notifier.send(message)
 
-        # Сохраняем
         try:
             await self.postgres.save_signal(signal)
         except Exception as e:
@@ -207,7 +216,6 @@ class SignalEngine:
             return 0.0
 
         vol_1m = sum(t["notional"] for t in trades_1m)
-        # средний за минуту в последний час
         avg_1m = sum(t["notional"] for t in trades_1h) / 60 if trades_1h else 0
         if avg_1m <= 0:
             return 0.0
