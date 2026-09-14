@@ -46,7 +46,7 @@ class Config:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
     # ===== Торговые настройки =====
-    TOP_SYMBOLS_COUNT: int = 30
+    TOP_SYMBOLS_COUNT: int = 50
     SYMBOLS_UPDATE_INTERVAL: int = 3600
     ORDERBOOK_DEPTH: int = 50
     TRADES_HISTORY_SECONDS: int = 1800
