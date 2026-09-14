@@ -53,7 +53,7 @@ class Config:
 
     ABSORPTION_WINDOW_SEC: int = 15
     SIGNAL_COOLDOWN_SEC: int = 600
-    SIGNAL_THRESHOLD: int = 70
+    SIGNAL_THRESHOLD: int = 60
 
     WEIGHTS = {
         "level": 20,

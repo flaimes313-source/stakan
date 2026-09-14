@@ -40,12 +40,12 @@ class AbsorptionDetector:
 
             median_trade = await self.store.get_median_trade_size(symbol)
             # Динамический порог: не меньше 5 * медианного notional и не меньше $50k
-            dyn_threshold = max(median_trade * 5, 50_000)
+            dyn_threshold = max(median_trade * 3, 20_000)
 
             # Поглощение продавцом: агрессивные покупки, цена у ask, стоит
-            if buy_vol >= dyn_threshold and abs(price_change) < 0.0008:
+            if buy_vol >= dyn_threshold and abs(price_change) < 0.0015:
                 ask_top_vol = sum(float(s) for _, s in ob["asks"][:5])
-                if ask_top_vol > 0 and buy_vol / ask_top_vol > 0.5:
+                if ask_top_vol > 0 and buy_vol / ask_top_vol > 0.3:
                     confidence = min(100, int((buy_vol / dyn_threshold) * 40))
                     return {
                         "detected": True,
@@ -58,9 +58,9 @@ class AbsorptionDetector:
                     }
 
             # Поглощение покупателем: агрессивные продажи, цена у bid, стоит
-            if sell_vol >= dyn_threshold and abs(price_change) < 0.0008:
+            if sell_vol >= dyn_threshold and abs(price_change) < 0.0015:
                 bid_top_vol = sum(float(s) for _, s in ob["bids"][:5])
-                if bid_top_vol > 0 and sell_vol / bid_top_vol > 0.5:
+                if bid_top_vol > 0 and sell_vol / bid_top_vol > 0.3:
                     confidence = min(100, int((sell_vol / dyn_threshold) * 40))
                     return {
                         "detected": True,
